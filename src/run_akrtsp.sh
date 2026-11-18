@@ -28,9 +28,13 @@ export LD_LIBRARY_PATH=/mnt/Factory/custom/lib
 
 INTERVAL=${1:-10}
 MAXFAILS=${2:-3}
-BIN=/tmp/akrtsp
-LOG=/tmp/akrtsp.log
-SUP=/tmp/akrtsp_sup.log
+# Paths come from the environment so the failure paths can be exercised on a bench
+# run with an isolated pidfile and log instead of this camera's live ones:
+#   BIN=/tmp/nothing PIDF=/tmp/t_sup.pid SUP=/tmp/t_sup.log sh /tmp/run_akrtsp.sh 2 1
+BIN=${BIN:-/tmp/akrtsp}
+LOG=${LOG:-/tmp/akrtsp.log}
+SUP=${SUP:-/tmp/akrtsp_sup.log}
+PIDF=${PIDF:-/tmp/akrtsp_sup.pid}
 AK_ARGS=${AK_ARGS:---force-night night}
 
 pids_by_comm()
@@ -51,14 +55,14 @@ fails=0
 # akrtsp at each other, which on this board means the second one dies on
 # "VIDIOC_S_FMT, Device or resource busy" while the first one streams - a crash
 # loop that looks like akrtsp being unreliable. Take over the old one by pidfile.
-if [ -f /tmp/akrtsp_sup.pid ]; then
-	OLD=$(cat /tmp/akrtsp_sup.pid 2>/dev/null)
+if [ -f "$PIDF" ]; then
+	OLD=$(cat "$PIDF" 2>/dev/null)
 	if [ -n "$OLD" ] && grep -q run_akrtsp /proc/$OLD/cmdline 2>/dev/null; then
 		kill "$OLD" 2>/dev/null
 		sleep 1
 	fi
 fi
-echo $$ > /tmp/akrtsp_sup.pid
+echo $$ > "$PIDF"
 
 say "supervisor up: interval=${INTERVAL}s maxfails=${MAXFAILS} args='$AK_ARGS' bin=$(md5sum $BIN 2>/dev/null | cut -c1-8)"
 
@@ -90,6 +94,10 @@ while :; do
 
 	# Nothing owns the port: this is the case the whole script exists for.
 	if [ ! -x "$BIN" ]; then
+		if [ -n "$NOFALLBACK" ]; then
+			say "no $BIN on disk; NOFALLBACK set, not touching the vendor server"
+			exit 1
+		fi
 		say "no $BIN on disk; falling back to the vendor server"
 		setsid /mnt/Factory/custom/rtsp >>/tmp/rtsp_run.log 2>&1 &
 		exit 1
@@ -105,7 +113,11 @@ while :; do
 	say "nothing on :554; starting akrtsp (attempt $fails/$MAXFAILS)"
 	setsid "$BIN" --port 554 --verbose $AK_ARGS >> "$LOG" 2>&1 &
 	sleep 6
-	if netstat -tln 2>/dev/null | grep -q ':554'; then
+	# Success means the process this script started is alive AND the port is up.
+	# Checking only the port is wrong: something else can be holding :554 (a
+	# wedged previous server, or a bench run next to a live one), and the supervisor
+	# then reports a start that never happened.
+	if [ -n "$(pids_by_comm akrtsp)" ] && netstat -tln 2>/dev/null | grep -q ':554'; then
 		say "akrtsp up on :554 (pid $(pids_by_comm akrtsp))"
 		continue
 	fi
@@ -114,6 +126,10 @@ while :; do
 	for p in $(pids_by_comm akrtsp); do kill -9 "$p" 2>/dev/null; done
 	sleep 2
 	if [ "$fails" -ge "$MAXFAILS" ]; then
+		if [ -n "$NOFALLBACK" ]; then
+			say "$fails failed starts in a row; NOFALLBACK set, giving up without the vendor server"
+			exit 1
+		fi
 		say "$fails failed starts in a row; starting the vendor server and giving up"
 		setsid /mnt/Factory/custom/rtsp >>/tmp/rtsp_run.log 2>&1 &
 		sleep 4

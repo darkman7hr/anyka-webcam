@@ -968,6 +968,18 @@ back (`isp -> night (--force-night)`, then R=G=B), and the restarted server meas
 disappears on reboot like the binary does, so boot persistence and supervision are
 the same decision (see section 6).
 
+The give-up-and-fall-back path was tested too, with `src/fake_akrtsp.sh` (a binary
+that always exits 1) under isolated paths so it could not touch the live instance:
+`BIN=/tmp/fake_akrtsp.sh PIDF=/tmp/t_sup.pid SUP=/tmp/t_sup.log NOFALLBACK=1`. With
+the real server deliberately down it counted `attempt 1/2`, `attempt 2/2`, and
+stopped at `2 failed starts in a row`. That bench run found a bug in the script's
+own success test: it had only asked `netstat` whether :554 was listening, which is
+true whenever *anything* holds the port — a wedged previous server, or this bench
+run sitting next to a live one — so it would have reported a start that never
+happened. Success now requires the process it launched to be alive by `comm` **and**
+the port to be up. `NOFALLBACK=1` exists for exactly this kind of test: it stops the
+supervisor from starting the vendor binary while a real server is still streaming.
+
 ## 5. Problems found that are worth fixing
 * **A supervisor that matched its own grep.** `grep -l run_takeover
   /proc/[0-9]*/cmdline` — meant to notice a handover in flight — also matched **the
@@ -1123,7 +1135,10 @@ anyka-cam/
   src/run_akrtsp.sh      supervisor: restart akrtsp when :554 has no owner, stand down
                          for the vendor server or a handover in flight, fall back to
                          the vendor binary after 3 failed starts, one instance, log to
-                         /tmp/akrtsp_sup.log
+                         /tmp/akrtsp_sup.log (BIN/LOG/SUP/PIDF/NOFALLBACK from the
+                         environment so failure paths can be tested without a live run)
+  src/fake_akrtsp.sh     a server that always fails, for testing the supervisor's
+                         restart counting and give-up path safely
   src/run_watch.sh       process CPU from /proc/<pid>/stat over a measured interval
                          (works for akrtsp or the vendor binary; top's %CPU cannot be trusted)
   src/akir_probe.c       read the light sensor and IR-cut thresholds straight off the
