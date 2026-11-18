@@ -199,7 +199,7 @@ section 9 — that is almost always the HLS redirect, not a codec problem.
 | `:8090` | the camweb UI if you never promoted it |
 | `:1984` | go2rtc's own UI/REST — only while a preview is running |
 | `:8554` | RTSP output, e.g. `rtsp://$CAM_HOST:8554/cam` for VLC or Home Assistant |
-| `:554` | the vendor's own RTSP: `/vs0` 1280x720, `/vs1` 640x480 |
+| `:554` | the stream server: `akrtsp` (section 14) or, after `run_takeover.sh --restore`, the vendor binary. Both serve `/vs0` 1280x720 and `/vs1` 640x480 |
 
 Useful one-liners:
 
@@ -314,10 +314,17 @@ and everything else keeps working.
 | `/mnt/Factory/config.sh` | `deploy.py --promote` — one line replaced, original kept in `backup/config.sh.orig` | restore the original |
 | `/mnt/camweb/live/` | `live.py --install` | yes |
 | `/tmp/live.log`, `/tmp/live.json`, `/tmp/camweb_live.lock` | the running supervisor | it cleans these up itself |
+| `/mnt/camrtsp/akrtsp`, `run_akrtsp.sh`, `run_takeover.sh` | section 14 (stream server) | yes: uncomment the vendor line in `config.sh` |
+| `/mnt/camweb/daynight.conf` | the UI (`act=nightmode`) and you | it is just the wanted mode; delete it and `--force-night` decides |
+| a second line in `/mnt/Factory/config.sh` | section 14, by hand | one-character uncomment of `# /mnt/Factory/custom/rtsp &` |
 
 Never touched: `/mnt/Factory/custom/web_interface/www` (stock docroot, left in
-place but no longer served once promoted), the vendor daemons, the RTSP server,
-the ISP/sensor configuration, the kernel modules.
+place but no longer served once promoted), the vendor binaries themselves
+(`/mnt/Factory/custom/rtsp` is still there and still runnable), the vendor
+daemons, the kernel modules. What **is** touched on purpose, once section 14 is
+followed: the ISP day/night mode (`ak_vi_switch_mode`), the IR illuminator and
+IR-cut gpio, and one line of `config.sh` — all of them described in README.md and
+all of them reversible.
 
 ## 13. Limits worth knowing before you deploy this
 
@@ -333,5 +340,107 @@ the ISP/sensor configuration, the kernel modules.
 * **No JPEG snapshot** on this unit (section 9).
 * **The camera's clock is wrong after boot** (1970 until the vendor daemon
   syncs), so log timestamps are relative, not wall-clock.
+
+## 14. The stream server (`akrtsp`) and day/night
+
+Sections 1-13 work without this: the camera streams on whatever owns `:554`.
+Install this part if you want the replacement server (measured better than the
+vendor binary — README, "Milestone 2") or the day/night control that goes with it.
+
+### 14.1 Build
+
+Needs the pinned armv5 toolchain and the SDK dump (see README "Cross-compiling";
+`ANYKA_ROOT` and `TOOLCHAIN` default to the paths in `src/Makefile`).
+
+```sh
+make -C src akrtsp          # compiled, not stripped
+make -C src check           # strips it: src/akrtsp.stripped  <- this is the file to ship
+```
+
+`make akrtsp` alone does **not** refresh `akrtsp.stripped`, and that stripped file
+is what the upload sends — build and check in one step, and `md5sum` both ends of
+every upload. The Makefile links against the SDK libraries from `rootfs_v1basic`
+because those are md5-identical to the camera's own `/mnt/Factory/custom/lib`;
+linking a neighbouring SDK build is how an ABI difference becomes a board you
+cannot debug.
+
+### 14.2 Install (a running binary cannot be overwritten in place)
+
+```sh
+python3 - <<'EOF'
+import ftplib
+f = ftplib.FTP('192.168.10.46', timeout=20)
+f.login('root', 'anyka')
+f.storbinary('STOR /tmp/akrtsp.new', open('src/akrtsp.stripped', 'rb'))
+f.quit()
+EOF
+./tools/cam.py 'md5sum /tmp/akrtsp.new'          # must equal the local md5
+./tools/cam.py 'cp /tmp/akrtsp.new /mnt/camrtsp/akrtsp.new && chmod +x /mnt/camrtsp/akrtsp.new && mv -f /mnt/camrtsp/akrtsp.new /mnt/camrtsp/akrtsp && md5sum /mnt/camrtsp/akrtsp'
+./tools/cam.py 'for p in $(ls /proc | grep -E "^[0-9]+$"); do read -r c < /proc/$p/comm 2>/dev/null; [ "$c" = akrtsp ] && kill $p; done'
+```
+
+`ftpd` answers `553 Error` if you try to write over a running executable — that is
+ETXTBSY wearing a different hat. Upload as `.new`, `mv -f` it into place (a rename
+needs no write permission on the running inode), and let the supervisor restart it;
+the stream is down for the ~10 s that takes, and the NVR reconnects by itself.
+
+### 14.3 Boot line — this is where the arguments really come from
+
+In `/mnt/Factory/config.sh`, at the point where the vendor server used to start
+(after `sleep 30`, so the ordering against `ptz_daemon` matches the vendor's):
+
+```sh
+BIN=/mnt/camrtsp/akrtsp AK_ARGS="--mode-file /mnt/camweb/daynight.conf --force-night night --ir-follow" \
+  /bin/sh /mnt/camrtsp/run_akrtsp.sh 10 3 >/tmp/akrtsp_boot.log 2>&1 &
+# /mnt/Factory/custom/rtsp &
+```
+
+Check it with `sh -n /mnt/Factory/config.sh` **on the camera** before trusting it,
+and keep the vendor line as a comment rather than deleting it: that comment is the
+rollback. Two traps that cost time here: `config.sh` sets `AK_ARGS`, so an option
+added only to `run_akrtsp.sh`'s default never reaches the camera; and `BIN` must
+point where the binary actually is, or the supervisor does the sensible thing —
+starts the vendor server and exits — quietly.
+
+### 14.4 Day/night mode
+
+```sh
+./tools/cam.py 'printf "night\n" > /mnt/camweb/daynight.conf'     # or day, or auto
+./tools/cam.py 'grep -E "^(mode|want|auto|auto_reason|auto_gain|auto_lamp|ircut)=" /tmp/akrtsp.status'
+```
+
+`auto` reads the ISP's auto-exposure gain, not the light sensor on this board
+(which reads DAY with the room light on and off) — the rule, the measured numbers
+and the probe behaviour are in README, "Auto day/night that works". The knobs are
+server options, set them in the `config.sh` line above:
+
+| option | default | meaning |
+|---|---|---|
+| `--auto-dark-gain` / `--auto-light-gain` | 9000 / 6500 | hysteresis thresholds on the AE analogue gain |
+| `--auto-dark-secs` / `--auto-lit-secs` | 15 / 30 | how long a reading must hold before it counts |
+| `--auto-probe-secs` / `--auto-settle-secs` | 16 / 10 | night -> day is decided with the camera's own IR lamp off, and the settling window is discarded |
+| `--auto-dwell-secs` / `--auto-rearm-secs` | 45 / 300 | minimum time in a state; wait after a probe said "still dark" |
+| `--no-auto-lamp` / `--no-auto-filter` | off | let auto drive only the ISP mode |
+| `--ir-led-node` / `--ircut-node` / `--ptz-fifo` | `/sys/user-gpio/IR_LED`, `/sys/user-gpio/gpio-ircut_a`, `/tmp/ptz.daemon` | the three surfaces auto moves |
+
+This install runs `auto`. To pin it to night instead, one command:
+`./tools/cam.py 'echo night > /mnt/camweb/daynight.conf'`.
+
+### 14.5 Prove that part works
+
+```sh
+sh tools/auto_check.sh                       # ~6 min, room light required: dark -> night,
+                                             # light on -> probe -> day, off -> night
+node tools/night-check.mjs                   # the panel in a real browser (start Chrome
+                                             # with --remote-debugging-port=9333 first)
+python3 tools/rtsp_probe.py -t 6 rtsp://$CAM_HOST:554/vs0
+python3 tools/rgbshot.py
+./tools/cam.py 'cat /proc/loadavg; grep -m1 ^pid= /tmp/akrtsp.status'
+```
+
+Expected on this board: 20 fps, one key frame per second, 0 sequence gaps, the
+night frame R=G=B across the full 0..255 range (a purple frame means the ISP is in
+day mode under the illuminator; a black one means the filter is in while the lamp
+is on), and a load average of 1.6-2.9 with the stream and the page open.
 
 

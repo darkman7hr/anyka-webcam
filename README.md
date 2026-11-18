@@ -909,9 +909,10 @@ each measured rather than assumed:
   resistor beside it. Acting on that reading made things worse in two ways — it
   switched the ISP back to day, and it inserted the IR-cut filter, which produced
   the black frame in the table. So `--auto-night` exists but is not the default,
-  and moving the mechanical filter is behind `--ir-follow`, off by default: a
-  sensor that lies should not be allowed to touch optics. `ptz_daemon` already
-  owns that gpio anyway.
+  and moving the mechanical filter is behind `--ir-follow`: a sensor that lies
+  should not be allowed to touch optics. `ptz_daemon` already owns that gpio
+  anyway. (What does decide it today is the auto-exposure loop, not this
+  resistor — see the next-but-one section; the filter now does follow the mode.)
 * **The library's own light-adaptation thread** (the `change_fps_pthread` and the
   "hight light / low light" blocks in `isp_gc1084.conf`, gated by
   `ak_vi_set_switch_fps_enable`): with it enabled and us not interfering at all,
@@ -949,6 +950,110 @@ picture — and the server sits at **23.3 % of the core** (10 s `/proc/stat` sam
 against 16–21 % before. Still well under the vendor's 29–34 %, and inside the
 1500 kbps main target.
 
+### Auto day/night that works: what the ISP's auto-exposure is already doing
+
+The section above concluded that nothing on this board can decide day from night.
+That was true of every source that had been tried, and it is no longer the
+conclusion, because one number had been sitting in the AE loop the whole time.
+`ak_vpss_isp_get_ae_run_info()` is declared in the headers this board's
+`libplat_vpss` really does export, and it returns the analogue gain, the digital
+gain, the integration time and the luminance the loop is holding. **The gain the
+loop spends to reach its target is the light meter this board has.** Measured with
+`tools/aewatch.sh`, which samples the status file every 8 s (and `tools/ae_ab.sh`,
+which does the same across a deliberate mode change):
+
+| scene | `ae_again` | `ae_lumi` | `ae_exp` (us) |
+|---|---|---|---|
+| room light on, day mode | 3 455 – 5 159 | 38 – 56 | 1350 |
+| room light off, still day mode | 12 500 – 13 300 | 26 – 63 | 1350 |
+| room light off, night mode | **16 384** (the ceiling) | 42 – 45 | 2250 |
+| day mode, illuminator forced off | pegged 16 384 | **2** | 1350 |
+
+Three things fall out of that table. The gain moves by a factor of four between a
+lit and a dark room, which the light dependent resistor never did (it read 1 both
+times, and `ldr=1` is still published so nobody has to take my word for it). The
+integration time follows the **ISP mode** — 1350 us day, 2250 us night — and did
+not move when the room light was switched, so it is a mode signature and must not
+be used as a light meter. And the last row is the trap: with the illuminator off,
+`ae_lumi` collapses to 2 while the gain pegs, because the camera is looking at its
+own lamp. A night -> day decision therefore has to be taken with that lamp off.
+
+So `auto` in the control file now means, with the flags that set each number:
+
+* **dark** — gain >= `--auto-dark-gain` (9000) for `--auto-dark-secs` (15 s);
+* **lit** — gain <= `--auto-light-gain` (6500) for `--auto-lit-secs` (30 s); the
+  two thresholds leave a gap in which nothing is counted at all, which is the
+  hysteresis;
+* any state is held at least `--auto-dwell-secs` (45 s) before it may change;
+* night -> day is never believed while the camera is lighting the scene: the
+  illuminator goes out for `--auto-probe-secs` (16 s), the first
+  `--auto-settle-secs` (10 s) of that are discarded so the loop can settle, and
+  only the reading **after** the window decides. A probe that answers "still dark"
+  sets `--auto-rearm-secs` (300 s) before the next attempt, so a room that is dark
+  at 23:00 is not re-tested every half minute;
+* all three surfaces move together, in the order that cannot produce a dead frame:
+  going to night opens the filter and lights the lamp **before** the ISP stops
+  doing colour, going to day kills the lamp and closes the filter **before** the
+  ISP starts again. `--no-auto-lamp` / `--no-auto-filter` take either one away
+  from auto (the nodes are `--ir-led-node`, `--ircut-node`, the fifo is
+  `--ptz-fifo`).
+
+The **starting** state is not sampled. The first AE reading after the capture
+starts is not the scene's: measured on a restart in a dark room it reported a low
+gain, the policy adopted day on it, and the camera then sat with the lamp off and
+the filter in — a black picture — for the minute it took the dark rule to gather
+its sustained readings. `auto` now starts from `--force-night` (night on this
+camera) and lets the rules move from a state that is known-good rather than one
+that was believed.
+
+The hardware is **read back**, not remembered. `ptz_daemon`'s `irinit`
+re-initialises the IR driver and puts its own idea of the illuminator on
+`/sys/user-gpio/IR_LED`: measured, a filter press from the web page left the lamp
+**off** while the server still believed it was on, and nothing corrected it. The
+lamp and the filter position are therefore re-read from their nodes every second
+and re-asserted once a minute if they have drifted. That is the difference between
+"the transition happened correctly once" and "the camera is in the right state
+right now".
+
+Measured round trip (`tools/auto_check.sh` — room light driven over MQTT, one
+sample every 8 s plus a real key frame at the end of each phase):
+
+| phase | asked | settled on | lamp | filter | frame |
+|---|---|---|---|---|---|
+| dark room | auto | night | on | out | R=G=B=131.1, 100 % near-neutral |
+| light on | auto | day (after probe) | off | in | R−G −20.6, 15 % neutral (colour) |
+| light off again | auto | night | on | out | R=G=B=126.3, 100 % near-neutral |
+
+and the server's own log across the middle transition, which is the part that used
+to fail:
+
+```
+auto: ae gain 4173 looks lit, probing ambient with the lamp out for 16 s
+day/night: ir illuminator -> off (ambient probe)
+day/night: ir-cut filter -> in (probe: ambient light): /sys/user-gpio/gpio-ircut_a reads 1
+day/night: isp -> day (probe: ambient light): 0
+day/night: ir-cut filter -> out (ae gain held high): /sys/user-gpio/gpio-ircut_a reads 0
+day/night: ir illuminator -> on (ae gain held high)
+day/night: isp -> night (ae gain held high): 0
+```
+
+Every claim in those lines was checked against the node it names, including the
+filter, which is a motor. The first version wrote `irinit` and `irsetircut 1` as
+**two** writes to `/tmp/ptz.daemon`; `ptz_daemon` rebuilds that fifo around its own
+ir work, so the first landed and the second went to a fifo that momentarily had no
+reader. The filter stayed where it was, the caller reported success, and the camera
+sat with the filter **in** and the illuminator **on** — black picture — until the
+log line made it obvious. It is one write now, retried while the daemon rebuilds
+the fifo, and the position is read back afterwards. The same fix is in the CGI's
+`act=ircut`, which also waits for the travel and now answers `moved: 0|1`; the page
+says "did NOT reach" instead of showing the position that was asked for.
+
+The status file carries the reasoning as well as the result: `ae_again`, `ae_lumi`,
+`ae_dark`, `ae_exp`, then `auto`, `auto_reason`, `auto_gain`, `auto_lamp`,
+`auto_probe`, `ircut`. `auto_reason` stays for 60 s instead of being overwritten by
+the next idle tick — the page samples every few seconds, and a reason that lives
+one second is a decision nobody can see afterwards.
+
 ### Supervision: what brings the stream server back when it dies
 
 Nothing did. Neither the vendor binary nor `akrtsp` restarts itself, so one crash
@@ -967,12 +1072,25 @@ that matters on a board with **one** capture pipeline:
 4. nothing owns :554 → start it, log it, count it. After 3 failed starts in a row,
    start the **vendor** server and give up: a camera recording on the worse server
    beats a camera with a better server that does not come up.
+5. **alive but not serving** → three rounds with an `akrtsp` process and nothing
+   listening on :554 and the supervisor kills it, which drops the loop into rule 4.
+   This one was found the hard way: the vendor close, `ak_vi_close()`, waits on the
+   thread `libplat_vi` starts for its own light adaptation (`vi_change_fps`), and
+   that thread does not always come back. The process then sat in `futex_wait` with
+   the encoder already torn down and **still holding the port** — `ps` reported a
+   healthy server, the NVR got nothing, and the supervisor, which had only been
+   asking whether a process called `akrtsp` existed, saw no problem at all. So the
+   server now runs its own teardown against an `alarm(10)` deadline and exits by
+   itself if the vendor cleanup stalls (the kernel releases the capture device,
+   which is what a crash does and what the next start already copes with), and this
+   rule is the second line of defence for the same shape of failure.
 
 It also keeps one instance (pidfile), rotates its own log at 400 kB because `/tmp`
 is tmpfs on a 32 MB box that has been OOM-killed before, and defaults to the same
-`AK_ARGS="--mode-file /mnt/camweb/daynight.conf --force-night night"` as the
-launcher, so a restarted process gets night mode without anyone remembering — and
-picks up whatever mode the UI had set, from the file.
+`AK_ARGS="--mode-file /mnt/camweb/daynight.conf --force-night night --ir-follow"`
+as the launcher, so a restarted process gets night mode and a filter that follows
+the mode without anyone remembering — and picks up whatever mode the UI had set,
+from the file.
 
 Tested by killing it, not by reading the script: `kill -9` on the running server
 left :554 empty, and the supervisor logged `nothing on :554; starting akrtsp
@@ -1008,7 +1126,8 @@ in the boot script.
 /mnt/camrtsp/run_akrtsp.sh     the supervisor; BIN defaults to this path if the
                                binary is here, else /tmp/akrtsp
 /mnt/camrtsp/run_takeover.sh   handover + --restore, so rollback survives a reboot
-/mnt/camweb/daynight.conf      the wanted ISP mode: one word, night here
+/mnt/camweb/daynight.conf      the wanted ISP mode: one word - day, night or auto
+                               (auto here: the AE rule described above)
 ```
 
 and in `/mnt/Factory/config.sh`, at the point where the vendor server used to start
@@ -1016,7 +1135,7 @@ and in `/mnt/Factory/config.sh`, at the point where the vendor server used to st
 one the vendor had):
 
 ```sh
-BIN=/mnt/camrtsp/akrtsp AK_ARGS="--mode-file /mnt/camweb/daynight.conf --force-night night" \
+BIN=/mnt/camrtsp/akrtsp AK_ARGS="--mode-file /mnt/camweb/daynight.conf --force-night night --ir-follow" \
   /bin/sh /mnt/camrtsp/run_akrtsp.sh 10 3 >/tmp/akrtsp_boot.log 2>&1 &
 # /mnt/Factory/custom/rtsp &
 ```
@@ -1038,6 +1157,16 @@ log and `/proc`: supervisor up at uptime 38 s, `akrtsp up on :554 (pid 1683)` at
 process with comm `rtsp` anywhere, NVR reconnected on its own, and the stream
 measured 20.20 fps, GOP 1.00 s, 0 seq gaps, 1.00 media s per wall s.
 
+Re-run after the AE-based auto landed, same boot, `auto` in the control file:
+supervisor up at uptime 38 s with the `--ir-follow` argument list, `akrtsp` up on
+:554 by 39 s, status `want=auto auto=night`, `ae_again=15369` (dark), illuminator
+node 1, IR-cut node 0, three NVR clients back on their own, `/vs0` measured 20.34
+fps / 0 gaps / 1.01 media s per wall s and the frame R=G=B=127.9 over the full
+0..255 range. Note that the boot line is where `AK_ARGS` really comes from: the
+script's own default is only used when `config.sh` does not set it, and it was — so
+an argument added only to the script silently never reached the camera until the
+boot line was checked.
+
 ### Day/night from the browser: three controls, three mechanisms
 
 "Switch the IR off" and "switch to day" sound like one request and are three
@@ -1049,36 +1178,79 @@ picture:
 |---|---|---|---|
 | **Image mode: day / night / auto** | the ISP's colour/IR handling | one word into `--mode-file`, read by the server's light thread every 5 s, applied with `ak_vi_switch_mode` — **no restart, the stream keeps running** | night `R=G=B`, 100 % neutral; day `R−G +55.7, B−G +36.5`, 5 % neutral (the purple picture) |
 | **IR illuminator** | the IR LEDs, a gpio | `echo 0\|1 > /sys/user-gpio/IR_LED` (world-writable) | mean luminance 142 → 127 and **75 % of the pixels of a static frame moved** (mean \|diff\| 27.5) — automatic gain takes back some of the brightness, so the mean alone understates it |
-| **IR-cut filter** | the mechanical filter in front of the sensor | `act=ircut`, through `ptz_daemon`, which drives the motor | filter in mean **44**, filter out **136**; takes a couple of seconds to travel, so the reply reports the position the filter is *in*, not the one that was asked for |
+| **IR-cut filter** | the mechanical filter in front of the sensor | `act=ircut`, through `ptz_daemon`, which drives the motor — **one** write of `irinit` + `irsetircut N` to the fifo, then the CGI waits for the node to arrive and answers `moved: 0|1` | filter in mean **44**, filter out **136**; it takes a couple of seconds to travel, and a command that never moved anything is now reported as that instead of as success |
 
 The server publishes the truth in `--status-file` (`/tmp/akrtsp.status`): its pid,
-the mode actually in force, the mode that was asked for, the light sensor, the
-configured fps and gop, client count and frame counters — written to a temp name and
-renamed so the CGI cannot read it half-written. The CGI puts that next to the two
-gpio nodes in `act=status` (`night_set`, `night_mode`, `ldr`, `ir_led`, `ircut`,
+the mode actually in force, the mode that was asked for, the light sensor, the AE
+readings (`ae_lumi`, `ae_dark`, `ae_again`, `ae_dgain`, `ae_idgain`, `ae_exp`), what
+auto settled on and **why** (`auto`, `auto_reason`, `auto_gain`, `auto_lamp`,
+`auto_probe`), the IR-cut position it read back (`ircut`), the configured fps and
+gop, client count and frame counters — written to a temp name and renamed so the
+CGI cannot read it half-written. The CGI puts that next to the two gpio nodes in
+`act=status` (`night_set`, `night_mode`, `ldr`, `ae_*`, `auto_*`, `ir_led`, `ircut`,
 `akrtsp`, `ak_pid`), and the page shows **asked** and **in force** side by side:
 
 ```
-asked: night  |  ISP now: night  |  light sensor: day  |  IR led: on  |  filter: out
+asked: auto  |  ISP now: night  |  auto: night (ae gain held high) @ gain 12946
+  |  ae gain 12946  |  scene 56/255  |  exp 2250  |  IR led: on  |  filter: out
 ```
 
-That line is the honest version of the earlier finding: the light sensor says
-**day** in a dark room lit only by this camera's own IR, which is exactly why
-`auto` is a button and not the default, and why the sensor is shown rather than
-hidden. A control that repaints itself from the last click is worse than no
-control, so every one of these re-reads the camera: `act=nightmode&state=day|night|auto`,
-`act=irled&state=on|off|get`, `act=ircut&state=0|1`.
+That line is the honest version of the earlier finding: the board's own light
+sensor says **day** in a dark room lit only by this camera's own IR, so it is
+still displayed (with a tooltip saying it is not used for anything) and the
+decision is made from the auto-exposure gain instead, which is what `auto_gain` and
+`auto_reason` are there to make auditable. A control that repaints itself from the
+last click is worse than no control, so every one of these re-reads the camera:
+`act=nightmode&state=day|night|auto`, `act=irled&state=on|off|get`,
+`act=ircut&state=0|1`.
 
 Verified in a real browser rather than with curl: `./tools/night-check.mjs` drives
 headless Chrome over CDP, clicks the page's own buttons and only passes when the
 camera reports the state back — mode reaching the ISP, illuminator off and on,
 filter travelling in and out, no page errors, ending with the camera as it was
-found. 11/11 twice, screenshot in `logs/night-panel.png`. The frame comparisons
-behind the two gpio rows come from `tools/ppmdiff.py`, which diffs two PPMs
-pixel-wise: mean brightness cannot show an illuminator doing anything while
+found. **11/11** on the build described here, screenshot in `logs/night-panel.png`.
+The policy itself is checked separately by `tools/auto_check.sh` (dark → night →
+light on → probe → day → light off → night, with the frame measured at each phase)
+and `tools/aewatch.sh` / `tools/ae_ab.sh` (the AE numbers behind it). The frame
+comparisons behind the two gpio rows come from `tools/ppmdiff.py`, which diffs two
+PPMs pixel-wise: mean brightness cannot show an illuminator doing anything while
 automatic exposure compensates, and it did not.
 
 ## 5. Problems found that are worth fixing
+
+* **A command that was accepted, reported as successful, and never carried out.**
+  `irinit` and `irsetircut 1` went to `/tmp/ptz.daemon` as two separate opens and
+  writes. `ptz_daemon` rebuilds that fifo around its own ir work, so between the two
+  writes it momentarily had no reader: the first command landed, the second
+  disappeared into an fifo with nobody reading, and the caller's own exit status was
+  fine. The filter never moved, the page showed the position that had been asked
+  for, and the camera sat with the filter **in** and the illuminator **on** — the
+  black-picture combination — for as long as nobody looked. One write carrying both
+  lines, retried while the daemon rebuilds the fifo, and the position read back
+  afterwards (in the server, in the CGI's `moved:` answer, and on the page). The
+  general rule for anything driven through another process: the write's return value
+  is not evidence that the hardware moved.
+* **A gpio that is not yours.** `/sys/user-gpio/IR_LED` is world-writable and looks
+  like a private output, but `ptz_daemon`'s `irinit` re-initialises the IR driver
+  and writes its own idea of the lamp there. So the server's memory of what it last
+  wrote became a lie, the drift-correction code had nothing to correct (it compared
+  two beliefs), and the illuminator stayed off in a dark room until the node was
+  read instead. Both lamp and filter are now re-read from the nodes every second and
+  re-asserted once a minute.
+* **A teardown that never returns, and a supervisor blind to it.** `ak_vi_close()`
+  waits on `libplat_vi`'s own `vi_change_fps` thread, which does not always come
+  back after a day/night switch. The process then sits in `futex_wait` with the
+  encoder gone and **still holding :554**; `ps` says healthy, the NVR gets nothing,
+  and a supervisor whose only question was "is there a process named akrtsp"
+  correctly answered "yes" forever. Fixed twice over: the server's cleanup runs
+  against an `alarm(10)` deadline and exits by itself, and the supervisor now also
+  kills an akrtsp that is alive with nothing listening on :554. "Process exists" and
+  "service is up" are different questions; the second one is the one that matters.
+* **The first reading of a loop is not the thing the loop measures.** Adopting the
+  day/night state from the first AE reading after the capture starts chose *day* in
+  a dark room, because the AE had not converged yet — and the wrong state here is
+  not cosmetic, it is the lamp off and the filter in. Start from a known-good state
+  and let the sustained rules move it.
 
 * **The monitoring cost more than the streaming.** The status endpoint needed to
   know whether `akrtsp` was alive, and the obvious busybox way — walk `/proc`,
@@ -1228,12 +1400,15 @@ automatic exposure compensates, and it did not.
    fallen back to day mode.
    Still genuinely open, in order of usefulness: (a) **UDP transport and RTCP** —
    every real client here is TCP and interleaved, so this is compatibility for
-   hypothetical clients, not a fix; (b) **a day/night decision based on the image**
-   rather than on a flag, which needs the ISP statistics that `libakispsdk` exports
-   without declaring them (see "The purple image") — until then `auto` follows a
-   light sensor that is wrong indoors, and the UI says so; (c) **what the IR
-   illuminator should do on a schedule** — the gpio is controllable and measured, but
-   nothing decides when to touch it.
+   hypothetical clients, not a fix; (b) **a day/night decision taken from the image
+   itself** rather than from the AE gain — the gain is a good proxy and is what
+   `auto` uses today (see "Auto day/night that works"), but the ISP's colour and
+   histogram statistics would separate "lit room" from "IR-lit room" directly, and
+   they are exported by `libakispsdk` without being declared, so that work means
+   guessing struct layouts on a board that cannot be debugged interactively;
+   (c) **what the illuminator should do on a schedule** — auto now drives it with
+   the mode, but a person, a clock or a motion event should be able to override
+   that for an hour without fighting the policy afterwards.
 
 ## 7. Do not touch
 
@@ -1242,7 +1417,12 @@ automatic exposure compensates, and it did not.
   filter is hold-to-engage on the `a` pin alone with several seconds of travel,
   and releasing the pin parks it half-way with a magenta image. `act=ircut` is
   exposed, one press at a time, and it is the one control worth being careful
-  with.
+  with. What changed is the discipline around it: it is commanded through
+  `ptz_daemon` with **one** write, its position is read back from `gpio-ircut_a`
+  before anything claims success, and it moves only together with the ISP mode
+  and the illuminator — the combinations that are wrong (filter in with the lamp
+  on, filter out with a day-mode ISP) are a black frame and a magenta frame
+  respectively, and both were observed here.
 * **`/etc/jffs2` is 700 KB with ~500 KB free.** That is why the Gerge flash copy
   cannot host a card-less UI. Anything added there must be tiny; this UI lives
   on the SD card instead.
@@ -1275,16 +1455,20 @@ anyka-cam/
   src/run_idle_test.sh   akrtsp with no client at all: lifetime and memory
   src/run_takeover.sh    move :554 from the vendor binary to akrtsp; --restore undoes it
                          (AK_ARGS defaults to --mode-file /mnt/camweb/daynight.conf
-                         --force-night night: the mode the UI chose wins, the flag is
-                         the fallback - the ISP boots in day mode and this room is lit
-                         only by IR, see "The purple image")
+                         --force-night night --ir-follow: the mode the UI chose wins,
+                         the flag is the fallback - the ISP boots in day mode and this
+                         room is lit only by IR, see "The purple image", and the filter
+                         has to go with the mode or the frame goes black)
   src/run_akrtsp.sh      supervisor: restart akrtsp when :554 has no owner, stand down
                          for the vendor server or a handover in flight, fall back to
                          the vendor binary after 3 failed starts, one instance, log to
                          /tmp/akrtsp_sup.log (BIN/LOG/SUP/PIDF/NOFALLBACK from the
                          environment so failure paths can be tested without a live run;
                          BIN defaults to /mnt/camrtsp/akrtsp when that exists, else
-                         /tmp/akrtsp - it has to be right in both places)
+                         /tmp/akrtsp - it has to be right in both places). Also kills
+                         an akrtsp that is alive with nothing on :554: a process
+                         wedged in the vendor teardown keeps the port and looks
+                         healthy to a process listing.
   src/fake_akrtsp.sh     a server that always fails, for testing the supervisor's
                          restart counting and give-up path safely
   src/run_watch.sh       process CPU from /proc/<pid>/stat over a measured interval
@@ -1300,6 +1484,20 @@ anyka-cam/
                          (everything tinted, neutrals included) from swapped chroma
                          (colours rotate, neutrals stay neutral) - and why grabbing
                          "the first frame" instead of a key frame reads as black
+  tools/aewatch.sh       sample the ISP auto-exposure straight from the status file
+                         on the camera (interval, count) into /tmp/ae.log. This is
+                         where the day/night numbers came from: lit 3.4k-5.1k gain,
+                         dark in day mode 12.5k-13.3k, dark in night mode pegged at
+                         the 16384 ceiling, and ae_exp following the ISP mode
+                         (1350 us day / 2250 us night) rather than the light
+  tools/ae_ab.sh         the same sampling across a deliberate day/night change, so
+                         "the gain is the light and the exposure time is the mode"
+                         is a measurement and not an assumption
+  tools/auto_check.sh    the auto day/night round trip on the live camera: dark ->
+                         night, room light on -> probe -> day, light off -> night,
+                         then restore the production mode; samples every 8 s and
+                         measures a real key frame at each phase, and keeps the
+                         server's own decision lines in /tmp/auto_check.log
   tools/aknet.py         cost and health of the stream server: CPU from
                          /proc/<pid>/stat over a measured interval, oom_score_adj,
                          RSS, Send-Q on the client sockets, wlan0 throughput vs the
@@ -1335,7 +1533,10 @@ anyka-cam/
                            video state every 4 s, for when the chip is too vague
   tools/relay.py         RTSP -> JPEG/MJPEG on a PC, so the UI gets a picture
   tools/loadtest.py      measure the CPU cost of polling this box
-  tools/package.sh       build the shareable dist/anyka-cam-*.tar.gz
+  tools/package.sh       build the shareable tarball: TAG=v1.0-final-YYYYMMDD for a
+                         named release, WITH_BINARIES=1 to keep the built binaries
+                         (they are excluded by default), KEEP_BINARY=0 to drop go2rtc;
+                         scrubs the API token out of the docs it ships
                          (drops .token/.port/logs/reference, scrubs the token)
   tools/diag.sh          headers, request log, preset JSON as the browser sees it
   tools/.token           access token
@@ -1373,7 +1574,9 @@ Camera side:
 /tmp/akrtsp_sup.log         supervisor log            (RAM, cleared on reboot)
 /tmp/akrtsp_sup.pid         supervisor pidfile        (RAM)
 /tmp/akrtsp.status          what the UI reads: pid, mode in force, mode asked for,
-                            light sensor, fps, gop, clients, frame counters (RAM)
+                            light sensor, AE readings (lumi/dark/gain/exp), what
+                            auto settled on and why, illuminator and IR-cut state,
+                            fps, gop, clients, frame counters (RAM)
 /tmp/camweb_web.log         runner log            (RAM, cleared on reboot)
 /tmp/camweb_req.log         API request log       (RAM, cleared on reboot)
 ```
