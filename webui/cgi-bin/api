@@ -1,0 +1,491 @@
+#!/bin/sh
+# Anyka AK3918 web UI JSON API.
+#
+# Query parameters are matched against a fixed whitelist. The stock Gerge
+# header CGI runs `eval $i` on every QUERY_STRING token, which is unauthenticated
+# remote root command execution; nothing here evaluates user input, and every
+# value is either type-checked as an integer or stripped to a safe character set
+# before it reaches the PTZ FIFO or a config file.
+#
+# PTZ contract, verified on the live camera:
+#   cat /etc/jffs2/ptz.ini                   -> "<pan> <tilt>" (current position)
+#   echo "t2p <pan> <tilt>" > /tmp/ptz.daemon  absolute move
+#   echo "left" > /tmp/ptz.daemon             relative move, fixed 10 deg
+# Relative moves are emulated with t2p so the UI can pick its own step size.
+
+FIFO=/tmp/ptz.daemon
+POS=/etc/jffs2/ptz.ini
+CONF=/mnt/camweb/webui.conf
+TOKENF=/mnt/camweb/token
+PRESETS=/mnt/camweb/presets
+
+# On-demand preview relay (go2rtc). Its config lives in its own file so the
+# relay's knobs never collide with the PTZ ones. Nothing here runs until a
+# browser asks for it: cgi-bin/api is the only thing that starts it, so it stays
+# behind the same token as every other mutation.
+LIVE=/mnt/camweb/live
+LPIDF=/tmp/camweb_live.pid
+LG2F=/tmp/camweb_g2.pid
+LSEEN=/tmp/live_seen
+LSTATE=/tmp/live_state
+LSTOPF=/tmp/live_stopflag
+LREADY=/tmp/live_ready
+
+
+
+# Once httpd is started by /mnt/Factory/config.sh at boot it inherits the boot
+# environment, not an interactive shell's. Without this the CGI can be running
+# with a PATH that finds no awk/sed/cut and every endpoint silently dies.
+PATH="/bin:/usr/bin:/sbin:/usr/sbin${PATH:+:$PATH}"
+export PATH
+
+. "$CONF" 2>/dev/null
+
+[ -n "$PAN_MIN" ]  || PAN_MIN=0
+[ -n "$PAN_MAX" ]  || PAN_MAX=360
+[ -n "$TILT_MIN" ] || TILT_MIN=10
+[ -n "$TILT_MAX" ] || TILT_MAX=170
+[ -n "$STEP_DEF" ] || STEP_DEF=10
+[ -n "$AUTH_EN" ]  || AUTH_EN=1
+
+jhdr() {
+  # busybox httpd adds no cache headers of its own, and the UI polls identical
+  # URLs (act=presets especially). A browser free to cache that response shows a
+  # stale preset list: the save really happens on the card, the screen never
+  # changes, and it looks exactly like "saving does not work".
+  echo "Content-type: application/json"
+  echo "Cache-Control: no-store, no-cache, must-revalidate"
+  echo "Pragma: no-cache"
+  echo "Expires: 0"
+  echo "Connection: close"
+  echo
+}
+esc()  { printf '%s' "$1" | sed -e 's/[&<>"\\]/ /g' -e 's/^ *//' -e 's/ *$//'; }
+
+# is_int: accept only an optional minus and digits.
+is_int() {
+  case "$1" in
+    ''|*[!0-9-]*) return 1 ;;
+    -*-*-*) return 1 ;;
+  esac
+  return 0
+}
+
+clamp() {
+  v=$1; lo=$2; hi=$3
+  [ "$v" -lt "$lo" ] && v=$lo
+  [ "$v" -gt "$hi" ] && v=$hi
+  printf '%s' "$v"
+}
+
+# ptz_send <line> -- strict daemon command whitelist.
+ptz_send() {
+  case "$1" in
+    init|up|down|left|right|left_up|left_down|right_up|right_down) ;;
+    t2p\ [0-9]*\ [0-9]*) ;;
+    set\ar\ [0-9]*) ;;
+    set\deg\ [0-9]*) ;;
+    irinit|irgettres|irgetinputlevel) ;;
+    irsetircut\ [01]) ;;
+    irsetcheckmode\ [0-9]*) ;;
+    *) return 1 ;;
+  esac
+  [ -p "$FIFO" ] || return 1
+  printf '%s\n' "$1" > "$FIFO"
+}
+
+# get_pos -> sets P_PAN P_TILT from the daemon's own position file.
+P_PAN=0; P_TILT=0
+get_pos() {
+  if [ -r "$POS" ]; then
+    set -- $(cat "$POS" 2>/dev/null)
+    if is_int "$1" && is_int "$2"; then P_PAN=$1; P_TILT=$2; fi
+  fi
+}
+
+
+# urldecode: expand + and %XX. busybox awk has no interval regex, hence the
+# explicit two hex digits, and hex is summed by hand rather than trusting "0x".
+urldecode() {
+  printf '%s' "$1" | awk '
+    function hex2d(h,   i, c, n) {
+      h = toupper(h); n = 0
+      for (i = 1; i <= length(h); i++) {
+        c = substr(h, i, 1)
+        n = n * 16 + index("0123456789ABCDEF", c) - 1
+      }
+      return n
+    }
+    {
+      gsub(/\+/, " ")
+      out = ""
+      while (match($0, /%[0-9A-Fa-f][0-9A-Fa-f]/)) {
+        out = out substr($0, 1, RSTART - 1) sprintf("%c", hex2d(substr($0, RSTART + 1, 2)))
+        $0 = substr($0, RSTART + 3)
+      }
+      print out $0
+    }'
+}
+
+# Preset files are "PAN TILT Name with spaces", read field by field. They are
+# deliberately never sourced: sourcing `NAME=Door Front` would run `Front`.
+read_preset() {
+  RP_LINE=$(cat "$1" 2>/dev/null)
+  RP_PAN=${RP_LINE%% *}
+  RP_REST=${RP_LINE#* }
+  RP_TILT=${RP_REST%% *}
+  if [ "$RP_REST" = "$RP_TILT" ]; then RP_NAME=""; else RP_NAME=${RP_REST#* }; fi
+}
+
+emit_presets() {
+  # Counting, not a boolean flag: `[ $first ]` is TRUE for the string "0", so an
+  # earlier version of this never printed the separator. With one preset the JSON
+  # was still valid; with two or more it was `...}{...`, JSON.parse threw, and the
+  # preset panel died silently — a save really happened on the card but the screen
+  # never changed, which is precisely what "saving does not work" looked like.
+  n=0
+  printf '{"ok":1,"presets":['
+  for f in $PRESETS/*.conf; do
+    [ -f "$f" ] || continue
+    slot=$(basename "$f" .conf)
+    read_preset "$f"
+    is_int "$RP_PAN" && is_int "$RP_TILT" || continue
+    [ "$n" -gt 0 ] && printf ','
+    n=$((n + 1))
+    printf '{"slot":"%s","pan":%s,"tilt":%s,"name":"%s"}' \
+      "$(esc "$slot")" "$RP_PAN" "$RP_TILT" "$(esc "$RP_NAME")"
+  done
+  printf ']}\n'
+}
+
+# ---- on-demand preview relay ------------------------------------------------
+. $LIVE/live.conf 2>/dev/null
+[ -n "$LIVE_API_PORT" ]  || LIVE_API_PORT=1984
+[ -n "$LIVE_RTSP_PORT" ] || LIVE_RTSP_PORT=8554
+[ -n "$LIVE_IDLE_S" ]    || LIVE_IDLE_S=300
+
+# live_alive <pidfile> -> echo the pid if that pid is really running. Two ways
+# this lies, both hit for real here: a pidfile left behind by a crash, and a
+# process that exited but was never reaped (a zombie keeps its /proc entry, so
+# "the directory exists" is not proof of life).
+live_alive() {
+  p=$(cat "$1" 2>/dev/null)
+  [ -n "$p" ] || return 1
+  [ -d "/proc/$p" ] || return 1
+  [ "$(awk '{print $3}' "/proc/$p/stat" 2>/dev/null)" = "Z" ] && return 1
+  printf '%s' "$p"
+}
+
+# live_sup -> echo the supervisor's pid only if it is alive AND still beating.
+# run_live.sh writes /tmp/camweb_live.lock/{pid,hb}; the heartbeat is what makes
+# a supervisor that was killed, wedged, or pid-reused stop counting as "running",
+# so a later request can reclaim the lock instead of being told "already
+# running" forever. The lock's pid wins over the plain pidfile: the pidfile used
+# to be written by whichever start finished last, losers included.
+LLOCK=/tmp/camweb_live.lock
+live_sup() {
+  p=$(cat $LLOCK/pid 2>/dev/null)
+  [ -n "$p" ] || p=$(live_alive $LPIDF)
+  [ -n "$p" ] || return 1
+  [ -d "/proc/$p" ] || return 1
+  [ "$(awk '{print $3}' "/proc/$p/stat" 2>/dev/null)" = "Z" ] && return 1
+  t=$(cut -d. -f1 /proc/uptime 2>/dev/null)
+  h=$(cat $LLOCK/hb 2>/dev/null)
+  case "$t" in ''|*[!0-9]*) t=0 ;; esac
+  case "$h" in ''|*[!0-9]*) h=0 ;; esac
+  [ $((t - h)) -ge 90 ] && return 1
+  printf '%s' "$p"
+}
+
+
+
+live_seen() { printf '%s\n' "$(date +%s)" > $LSEEN 2>/dev/null; }
+
+# Same available-memory estimate run_live.sh guards on, so what the page shows
+# and what the supervisor acts on are the same number. MemFree alone is
+# misleading on this board: ~19 MB of its 36 MB is reclaimable page cache.
+live_avail() {
+  m=$(cat /proc/sys/vm/min_free_kbytes 2>/dev/null)
+  awk -v m="$m" '
+    $1 == "MemAvailable:"  { a = $2 }
+    $1 == "MemFree:"       { f = $2 }
+    $1 == "Cached:"        { c = $2 }
+    $1 == "Buffers:"       { b = $2 }
+    $1 == "SReclaimable:"  { s = $2 }
+    END {
+      if (a > 0) { print a; exit }
+      v = f + c + b + s - (m + 0)
+      print (v > 0 ? v : 0)
+    }' /proc/meminfo 2>/dev/null
+}
+
+
+
+# live_json <fragment> -- every live endpoint answers with the same object, so
+# the page never has to guess which fields exist. <fragment> is raw JSON already
+# ending in a comma, letting an endpoint add its own result without a second
+# shape. RSS comes from statm (pages * 4) because ps on this busybox reports
+# neither.
+live_json() {
+  sp=$(live_sup)
+  gp=$(live_alive $LG2F)
+  st=$(cat $LSTATE 2>/dev/null)
+  rss=0
+  [ -n "$gp" ] && [ -r "/proc/$gp/statm" ] && rss=$(awk '{print $2 * 4}' "/proc/$gp/statm" 2>/dev/null)
+  mf=$(awk '/MemFree/{print $2}' /proc/meminfo 2>/dev/null)
+  [ -n "$mf" ] || mf=0
+  av=$(live_avail)
+  [ -n "$av" ] || av=0
+
+  host=$(ip route get 1 2>/dev/null | awk '{print $NF;exit}')
+  case "$host" in *.*) : ;; *) host="" ;; esac
+  [ -n "$host" ] || host=$(ifconfig wlan0 2>/dev/null | grep 'inet addr' | cut -d: -f2 | cut -d' ' -f1)
+  printf '{"ok":1,%s"running":%s,"sup":"%s","pid":"%s","rss_kb":%s,"free_kb":%s,"avail_kb":%s,"state":"%s","en":%s,"off":%s,"idle_s":%s,"src":"%s","api_port":%s,"rtsp_port":%s,"page":"http://%s:%s/","rtsp_out":"rtsp://%s:%s/cam"}\n' \
+    "$1" \
+    "$(if [ -n "$gp" ]; then echo 1; else echo 0; fi)" \
+    "$sp" "$gp" "$rss" "$mf" "$av" "$(esc "$st")" \
+    "${LIVE_EN:-1}" "$(if [ -f $LIVE/disable ]; then echo 1; else echo 0; fi)" \
+    "$LIVE_IDLE_S" "$(esc "$LIVE_SRC")" "$LIVE_API_PORT" "$LIVE_RTSP_PORT" \
+    "$host" "$LIVE_API_PORT" "$host" "$LIVE_RTSP_PORT"
+}
+
+# ---- request log -------------------------------------------------------------
+
+# Mutations only, never the 1.5 s status polls, and kept in RAM: /mnt is the SD
+# card. This exists because "the button does nothing" is not observable from
+# here. It answers the one question that matters: did the browser's request
+# actually reach the camera, with which arguments?
+REQLOG=/tmp/camweb_req.log
+safe() { printf '%s' "$1" | sed -e 's/[^A-Za-z0-9 ._:-]//g'; }
+logreq() {
+  printf '%ss a=%s d=%s s=%s p=%s t=%s n=%s from=%s\n' \
+    "$(cut -d. -f1 /proc/uptime 2>/dev/null)" \
+    "$(safe "$act")" "$(safe "$dir")" "$(safe "$slot")" "$(safe "$pan")" \
+    "$(safe "$tilt")" "$(safe "$name")" "$(safe "$REMOTE_ADDR")" >> "$REQLOG" 2>/dev/null
+  n=$(wc -l < "$REQLOG" 2>/dev/null)
+  [ -z "$n" ] && n=0
+  if [ "$n" -gt 60 ]; then
+    tail -n 60 "$REQLOG" > "$REQLOG.t" 2>/dev/null && mv "$REQLOG.t" "$REQLOG" 2>/dev/null
+  fi
+}
+
+# ---- parse query (whitelist only) ----
+act=""; dir=""; pan=""; tilt=""; slot=""; name=""; state=""; step=""; cmd=""; tok="$HTTP_X_TOKEN"
+oldIFS=$IFS; IFS='&'
+for kv in $QUERY_STRING; do
+  k=${kv%%=*}; v=${kv#*=}
+  case "$k" in
+    act) act=$v ;;       dir) dir=$v ;;     pan) pan=$v ;;
+    tilt) tilt=$v ;;     slot) slot=$v ;;   name) name=$v ;;
+    state) state=$v ;;   step) step=$v ;;   cmd) cmd=$v ;;
+    token) tok=$v ;;
+  esac
+done
+IFS=$oldIFS
+
+# Names: percent-decode, drop anything unfriendly, cap the length.
+name=$(urldecode "$name" | sed -e 's/[^A-Za-z0-9 ._:-]//g' -e 's/^\(.\{0,24\}\).*/\1/')
+
+jhdr
+[ -n "$act" ] || { echo '{"ok":0,"err":"no act"}'; exit 0; }
+
+# Logged before the token check on purpose: if a click leaves no line here, the
+# request never arrived (wrong page, wrong port, stale cache) — and if a line is
+# here but the browser saw nothing, the problem is on the way back.
+case "$act" in
+  status|presets|log|live_beat|live_status) : ;;
+  *) logreq ;;
+esac
+
+
+if [ "$AUTH_EN" = "1" ] && [ -f "$TOKENF" ]; then
+  if [ "$tok" != "$(cat "$TOKENF")" ]; then
+    echo '{"ok":0,"err":"unauthorized"}'; exit 0
+  fi
+fi
+
+case "$act" in
+
+  status)
+    get_pos
+    up=$(cut -d' ' -f1 /proc/uptime 2>/dev/null | cut -d. -f1)
+    ld=$(cut -d' ' -f1 /proc/loadavg 2>/dev/null)
+    mt=$(awk '/MemTotal/{print int($2/1024+0.5)}' /proc/meminfo 2>/dev/null)
+    # "free" in the header means usable, not raw MemFree. This kernel has no
+    # MemAvailable, and MemFree sat at 3 MB while 24 MB of reclaimable page
+    # cache was there - a number that reads like an emergency and means nothing.
+    # live_avail() does the same math the relay guard uses, so the header and the
+    # refusal threshold cannot disagree with each other.
+    av=$(live_avail); [ -n "$av" ] || av=0
+    mf=$(awk -v k="$av" 'BEGIN{print int(k/1024+0.5)}')
+    ip=$(ip route get 1 2>/dev/null | awk '{print $NF;exit}')
+    case "$ip" in *.*) : ;; *) ip=$(ifconfig wlan0 2>/dev/null | grep 'inet addr' | cut -d: -f2 | cut -d' ' -f1) ;; esac
+    rs=$(awk '/wlan0/{gsub(/\./,"",$3); gsub(/\./,"",$4); print $3"|"$4}' /proc/net/wireless 2>/dev/null | head -1)
+    echo "{\"ok\":1,\"pan\":$P_PAN,\"tilt\":$P_TILT,\"uptime\":${up:-0},\"load\":\"${ld:-?}\",\"mem_total\":${mt:-0},\"mem_free\":${mf:-0},\"ip\":\"$(esc "$ip")\",\"link\":\"$(esc "$rs")\",\"pan_min\":$PAN_MIN,\"pan_max\":$PAN_MAX,\"tilt_min\":$TILT_MIN,\"tilt_max\":$TILT_MAX,\"step\":$STEP_DEF,\"preview_url\":\"$(esc "$PREVIEW_URL")\",\"live_en\":${LIVE_EN:-1},\"live_off\":$(if [ -f $LIVE/disable ]; then echo 1; else echo 0; fi),\"live_running\":$(if live_alive $LG2F >/dev/null; then echo 1; else echo 0; fi),\"live_port\":$LIVE_API_PORT,\"live_rtsp_port\":$LIVE_RTSP_PORT}"
+    ;;
+
+  ptz)
+    get_pos
+    is_int "$step" || step=$STEP_DEF
+    [ "$step" -lt 1 ] && step=1
+    [ "$step" -gt 90 ] && step=90
+    npan=$P_PAN; ntilt=$P_TILT
+    case "$dir" in
+      up)    ntilt=$((P_TILT - step)) ;;
+      down)  ntilt=$((P_TILT + step)) ;;
+      left)  npan=$((P_PAN - step)) ;;
+      right) npan=$((P_PAN + step)) ;;
+      ul)    npan=$((P_PAN - step)); ntilt=$((P_TILT - step)) ;;
+      ur)    npan=$((P_PAN + step)); ntilt=$((P_TILT - step)) ;;
+      dl)    npan=$((P_PAN - step)); ntilt=$((P_TILT + step)) ;;
+      dr)    npan=$((P_PAN + step)); ntilt=$((P_TILT + step)) ;;
+      *) echo '{"ok":0,"err":"bad dir"}'; exit 0 ;;
+    esac
+    npan=$(clamp $npan $PAN_MIN $PAN_MAX)
+    ntilt=$(clamp $ntilt $TILT_MIN $TILT_MAX)
+    ptz_send "t2p $npan $ntilt"
+    echo "{\"ok\":1,\"pan\":$npan,\"tilt\":$ntilt}"
+    ;;
+  goto)
+    is_int "$pan" && is_int "$tilt" || { echo '{"ok":0,"err":"bad args"}'; exit 0; }
+    pan=$(clamp $pan $PAN_MIN $PAN_MAX)
+    tilt=$(clamp $tilt $TILT_MIN $TILT_MAX)
+    ptz_send "t2p $pan $tilt"
+    echo "{\"ok\":1,\"pan\":$pan,\"tilt\":$tilt}"
+    ;;
+
+  home)
+    ptz_send "init"
+    echo '{"ok":1}'
+    ;;
+
+  raw)
+    # Whole daemon, but only through the same whitelist ptz_send enforces.
+    if ptz_send "$cmd"; then echo '{"ok":1}'; else echo '{"ok":0,"err":"command not allowed"}'; fi
+    ;;
+
+  log)
+    # Last mutations, so the problem can be read from here instead of guessed.
+    printf '{"ok":1,"lines":['
+    if [ -r "$REQLOG" ]; then
+      tail -n 40 "$REQLOG" | awk '{printf "%s\"%s\"", (NR > 1 ? "," : ""), $0}'
+    fi
+    printf ']}\n'
+    ;;
+
+  presets)
+    [ -d "$PRESETS" ] || mkdir -p "$PRESETS" 2>/dev/null
+    emit_presets
+    ;;
+
+  preset_save)
+    [ -d "$PRESETS" ] || mkdir -p "$PRESETS" 2>/dev/null
+    case "$slot" in ''|*[!0-9]*) echo '{"ok":0,"err":"bad slot"}'; exit 0 ;; esac
+    get_pos
+    is_int "$pan" || pan=$P_PAN
+    is_int "$tilt" || tilt=$P_TILT
+    [ -n "$name" ] || name="Preset $slot"
+    printf '%s %s %s\n' "$pan" "$tilt" "$name" > "$PRESETS/$slot.conf"
+    echo "{\"ok\":1,\"slot\":\"$slot\",\"pan\":$pan,\"tilt\":$tilt,\"name\":\"$(esc "$name")\"}"
+    ;;
+
+  preset_goto)
+    case "$slot" in ''|*[!0-9]*) echo '{"ok":0,"err":"bad slot"}'; exit 0 ;; esac
+    f=$PRESETS/$slot.conf
+    [ -f "$f" ] || { echo '{"ok":0,"err":"no such preset"}'; exit 0; }
+    read_preset "$f"
+    is_int "$RP_PAN" && is_int "$RP_TILT" || { echo '{"ok":0,"err":"bad preset file"}'; exit 0; }
+    ptz_send "t2p $RP_PAN $RP_TILT"
+    echo "{\"ok\":1,\"pan\":$RP_PAN,\"tilt\":$RP_TILT,\"name\":\"$(esc "$RP_NAME")\"}"
+    ;;
+
+  preset_del)
+    case "$slot" in ''|*[!0-9]*) echo '{"ok":0,"err":"bad slot"}'; exit 0 ;; esac
+    rm -f "$PRESETS/$slot.conf"
+    echo '{"ok":1}'
+    ;;
+
+  led)
+    case "$state" in
+      1|on)  echo 1 > /sys/user-gpio/WHITE_LED 2>/dev/null ;;
+      0|off) echo 0 > /sys/user-gpio/WHITE_LED 2>/dev/null ;;
+    esac
+    echo '{"ok":1}'
+    ;;
+
+  ircut)
+    # Mechanical, several seconds of travel, and it parks visibly if left
+    # half-way -- exposed deliberately, but one press at a time.
+    case "$state" in
+      1) ptz_send "irinit"; ptz_send "irsetircut 1" ;;
+      0) ptz_send "irinit"; ptz_send "irsetircut 0" ;;
+      *) echo '{"ok":0,"err":"bad state"}'; exit 0 ;;
+    esac
+    echo '{"ok":1}'
+    ;;
+
+  live_start)
+    # Answer immediately. This box has one CPU and one httpd worker per
+    # connection: a live_start that sat here polling for the port held the web
+    # server for 15-30 s, starved the page's own status polls, and made four
+    # concurrent starts look like a hang. Starting is cheap; the page and
+    # tools/live.py poll live_status instead, which costs the same as any other
+    # endpoint. run_live.sh holds an atomic lock, so a second concurrent start
+    # here cannot produce a second supervisor.
+    if [ ! -x "$LIVE/go2rtc" ]; then echo '{"ok":0,"err":"relay not installed - run tools/live.py --install"}'; exit 0; fi
+    if [ -f "$LIVE/disable" ]; then echo '{"ok":0,"err":"relay disabled on the camera (rm /mnt/camweb/live/disable)"}'; exit 0; fi
+    if [ "${LIVE_EN:-1}" != "1" ]; then echo '{"ok":0,"err":"relay disabled (LIVE_EN=0 in live.conf)"}'; exit 0; fi
+    live_seen
+    started=0
+    if [ -z "$(live_sup)" ]; then
+      rm -f $LSTOPF $LREADY
+      # No pidfile is written here on purpose. run_live.sh takes an atomic lock
+      # and records its own PID in it; had the CGI recorded $! instead, four
+      # concurrent starts each wrote their child and the file ended up naming a
+      # loser that had already exited - which then looked like a dead supervisor.
+      setsid /bin/sh $LIVE/run_live.sh </dev/null >>/tmp/live_boot.log 2>&1 &
+      started=1
+    fi
+    live_json "\"started\":$started,"
+    ;;
+
+
+
+  live_beat)
+    # The relay's idle timer. A viewer that goes away stops beating, and the
+    # supervisor shuts everything down LIVE_IDLE_S later -- so a forgotten
+    # browser tab costs the camera at most that much time, not forever.
+    live_seen
+    live_json ""
+    ;;
+
+  live_status)
+    live_json ""
+    ;;
+
+  live_stop)
+    /bin/sh $LIVE/stop_live.sh >/dev/null 2>&1
+    live_json "\"stopped\":1,"
+    ;;
+
+  live_off)
+    /bin/sh $LIVE/stop_live.sh --disable >/dev/null 2>&1
+    live_json ""
+    ;;
+
+  live_on)
+    /bin/sh $LIVE/stop_live.sh --enable >/dev/null 2>&1
+    live_json ""
+    ;;
+
+  reboot)
+    echo '{"ok":1}'
+    (sync; sleep 1; reboot) >/dev/null 2>&1 &
+    ;;
+
+
+  *)
+    echo '{"ok":0,"err":"unknown act"}'
+    ;;
+esac
+

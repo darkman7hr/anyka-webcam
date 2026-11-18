@@ -1,0 +1,261 @@
+ELF
+/lib/ld-uClibc.so.0
+libplat_vi.so
+ak_vi_close
+ak_vi_get_sensor_resolution
+ak_thread_get_tid
+ak_thread_create
+ak_vi_get_handle
+__deregister_frame_info
+_ITM_registerTMCloneTable
+ak_vi_set_channel_attr
+ak_sleep_ms
+_ITM_deregisterTMCloneTable
+ak_print
+memset
+ak_vi_switch_mode
+_fini
+sprintf
+ak_vi_capture_on
+ak_vi_open
+ak_vi_match_sensor
+ak_thread_exit
+ak_thread_set_name
+_Jv_RegisterClasses
+__register_frame_info
+libplat_thread.so
+libakispsdk.so
+libplat_common.so
+system
+ak_backtrace
+atoi
+libakuio.so
+puts
+libplat_vpss.so
+libplat_ipcsrv.so
+libakstreamenc.so
+libmpi_venc.so
+libapp_rtsp.so
+ak_rtsp_start
+ak_rtsp_exit
+ak_rtsp_init
+ak_rtsp_stop
+libapp_net.so
+libplat_ai.so
+libakae.so
+libplat_drv.so
+ak_drv_ir_init
+ak_drv_ir_get_input_level
+libmpi_aenc.so
+libakmedia.so
+libmpi_aed.so
+libakaudiocodec.so
+libc.so.0
+getopt_long
+optarg
+abort
+signal
+sigaction
+__uClibc_main
+_edata
+__bss_start
+__bss_start__
+__bss_end__
+__end__
+_end
+H0K
+H0K
+A?K
+a0C
+vs0
+vs1
+help
+main-width
+main-height 
+sub-width
+sub-height
+main-kbps
+sub-kbps
+main-chn-name
+sub-chn-name
+gop
+minqp
+maxqp
+vs0
+vs1
+/etc/jffs2/
+[%s:%d] match sensor failed
+[%s:%d] vi open failed
+[%s:%d] get sensor resolution failed
+sensor resolution height:%d, width:%d.
+[%s:%d] set channel attribute failed
+[%s:%d] start capture ...
+[%s:%d] start capture failed
+	--%-16s -%c %s
+rm -f /tmp/core_*
+echo %d > %s
+now set to day
+/sys/user-gpio/gpio-ircut_a
+/sys/user-gpio/IR_LED
+now set to night
+[%s:%d] Thread start, id: %ld
+PS_switch
+prev_state=%d, ir_val=%d
+[%s:%d] Thread exit, id: %ld
+[%s:%d] misc already start
+ha:b:c:d:e:f:g:i:j:k:l:m:n:o:p:q:r:
+vi init fail
+vi init ok
+init rtsp, ret: %d
+[%s:%d] 
+	---- init rtsp failed ---- !
+ak_rtsp_vi_init
+photosensitive_switch_th_ex
+ak_misc_start_photosensitive_switch_ex
+main
+       HELP
+[NUM]  ( DEFAULT: 1920 )
+[NUM]  ( DEFAULT: 1080 )
+[NUM]  ( DEFAULT: 640 )
+[NUM]  ( DEFAULT: 360 )
+[NUM]  ( DEFAULT: 2000 )
+[NUM]  ( DEFAULT: 200 )
+[NAME] ( DEFAULT: 'vs0' )
+[NAME] ( DEFAULT: 'vs1' )
+[NUM]  ( DEFAULT: 50 )
+[NUM]  ( DEFAULT: 28 )
+[NUM]  ( DEFAULT: 42 )
+GCC: (GNU) 3.3.2 20031005 (Debian prerelease)
+GCC: (anyka (gcc-4.8.5 + binutils-2.24 + ulcibc-0.9.33.2)(20170223)) 4.8.5
+aeabi
+ARM926EJ-S
+.symtab
+.strtab
+.shstrtab
+.interp
+.hash
+.dynsym
+.dynstr
+.rel.dyn
+.rel.plt
+.init
+.text
+.fini
+.rodata
+.eh_frame
+.init_array
+.fini_array
+.jcr
+.dynamic
+.got
+.data
+.bss
+.comment
+.ARM.attributes
+/opt/arm-anykav200-crosstool/usr/arm-anykav200-linux-uclibcgnueabi/sysroot/usr/lib/crt1.o
+initfini.c
+crtstuff.c
+__EH_FRAME_BEGIN__
+__JCR_LIST__
+deregister_tm_clones
+register_tm_clones
+__do_global_dtors_aux
+completed.8817
+__do_global_dtors_aux_fini_array_entry
+frame_dummy
+object.8822
+__frame_dummy_init_array_entry
+ak_rtsp_demo.c
+misc_ctrl
+run_flag
+ak_rtsp_vi_init
+__func__.6489
+help_hint
+process_signal
+register_signal
+camera_set_ir
+photosensitive_switch_th_ex
+__func__.6534
+__func__.6542
+init_other_platform
+__func__.6576
+__FRAME_END__
+__JCR_END__
+_DYNAMIC
+_GLOBAL_OFFSET_TABLE_
+main
+abort
+__uClibc_main
+_bss_end__
+_fini
+pc_prog_name
+__deregister_frame_info
+signal
+i_sub_fps
+option_long
+ak_print
+__data_start
+ak_vi_get_handle
+i_main_fps
+memset
+ak_drv_ir_get_input_level
+_Jv_RegisterClasses
+i_sub_kbps
+ak_vi_switch_mode
+system
+ak_rtsp_start
+ak_vi_close
+_ITM_deregisterTMCloneTable
+_init
+ak_vi_get_sensor_resolution
+i_sub_mode
+vi_handle
+ak_rtsp_exit
+optarg
+ak_rtsp_init
+ac_option_hint
+pc_sub_name
+ak_vi_match_sensor
+ak_backtrace
+i_main_kbps
+i_gop
+printf
+pc_main_name
+ak_vi_open
+ak_rtsp_stop
+_start
+__register_frame_info
+ak_misc_set_video_day_night
+ak_misc_start_photosensitive_switch_ex
+__bss_start
+__dso_handle
+__end__
+_ITM_registerTMCloneTable
+ak_vi_set_channel_attr
+i_main_width
+ak_thread_set_name
+ak_thread_create
+i_main_height
+i_main_type
+i_main_mode
+__bss_start__
+i_maxqp
+i_sub_width
+__TMC_END__
+i_sub_height
+i_sub_type
+i_minqp
+atoi
+ak_vi_capture_on
+_edata
+puts
+__bss_end__
+ak_sleep_ms
+ak_drv_ir_init
+sprintf
+sigaction
+_end
+ak_thread_exit
+data_start
+ak_thread_get_tid
+getopt_long

@@ -1,0 +1,33 @@
+# This repo is the findings log plus the code that produced it. What is excluded
+# is excluded for a reason, not by accident:
+#
+# upstream repo vendored for study (15 MB, re-fetchable from its own source) -
+# kept locally, not carried through history. Note the two directories that ARE
+# tracked even though they hold vendor material: pull/ (the original config.sh and
+# web pages, i.e. the undo path) and logs/vendor/ (the .so files every ABI claim in
+# the README was derived from). Small, and losing them would make the findings
+# unreproducible. They are proprietary: do not push this repo anywhere public and
+# do not redistribute them.
+reference/
+
+# regenerable: tools/package.sh builds it
+dist/
+
+# the camera's API token. Never commit it; nothing else in the tree contains it
+# (checked with grep -rl before the first commit)
+tools/.token
+*.token
+
+# cross-compiled build products - rebuild with the armv5 toolchain, and a stale
+# akrtsp.stripped is a real deployment hazard here (see README, "Deploying the
+# wrong binary")
+src/akstream
+src/akrtsp
+src/akrtsp.stripped
+src/irprobe
+src/*.o
+*.elf
+
+# local relay/browser scratch
+__pycache__/
+*.pyc

@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Anyka Cam</title>
+<style>
+:root{
+  --bg:#0d1117;--panel:#161b22;--panel2:#1c2230;--line:#2a3242;
+  --fg:#e6edf3;--dim:#8b98a9;--acc:#3fb6ff;--acc2:#1f6feb;--ok:#3fb950;--warn:#d29922;--bad:#f85149;--r:12px;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%}
+body{background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;padding-bottom:24px}
+header{position:sticky;top:0;z-index:10;background:linear-gradient(180deg,#0d1117 72%,rgba(13,17,23,.85));backdrop-filter:blur(6px);border-bottom:1px solid var(--line);padding:10px 14px;display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+header h1{font-size:15px;margin:0;font-weight:650;letter-spacing:.3px}
+.chip{font-size:11px;color:var(--dim);background:var(--panel2);border:1px solid var(--line);border-radius:999px;padding:3px 9px;white-space:nowrap}
+.chip b{color:var(--fg);font-weight:600;font-variant-numeric:tabular-nums}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--bad);display:inline-block;margin-right:5px;vertical-align:1px}
+.dot.on{background:var(--ok)}
+main{max-width:1200px;margin:0 auto;padding:12px;display:grid;gap:12px;grid-template-columns:minmax(0,1.35fr) minmax(280px,1fr);align-items:start}
+@media(max-width:860px){main{grid-template-columns:1fr}}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);overflow:hidden}
+.card>h2{margin:0;font-size:11px;text-transform:uppercase;letter-spacing:.09em;color:var(--dim);padding:11px 14px;border-bottom:1px solid var(--line);background:var(--panel2);display:flex;justify-content:space-between;align-items:center;gap:8px}
+.card>h2 .sub{font-size:10px;text-transform:none;letter-spacing:0;color:var(--dim);font-weight:400}
+.body{padding:14px}
+.stage{position:relative;background:#000;aspect-ratio:16/9;display:flex;align-items:center;justify-content:center;overflow:hidden;touch-action:none;cursor:crosshair}
+.stage img{width:100%;height:100%;object-fit:contain;-webkit-user-drag:none;user-select:none}
+.stage video{width:100%;height:100%;object-fit:contain;background:#000}
+
+.stage .off{color:var(--dim);text-align:center;padding:18px;font-size:13px;line-height:1.65}
+.stage .off code{background:var(--panel2);padding:1px 5px;border-radius:4px;font-size:12px;color:var(--acc);word-break:break-all}
+.xhair{position:absolute;inset:0;pointer-events:none}
+.xhair:before,.xhair:after{content:"";position:absolute;background:rgba(63,182,255,.32)}
+.xhair:before{left:50%;top:0;bottom:0;width:1px}
+.xhair:after{top:50%;left:0;right:0;height:1px}
+.posbadge{position:absolute;left:10px;bottom:10px;background:rgba(0,0,0,.62);border:1px solid var(--line);border-radius:8px;padding:5px 10px;font-variant-numeric:tabular-nums;font-size:12px;letter-spacing:.3px}
+.posbadge b{color:var(--acc);font-weight:650}
+.pad{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;max-width:236px;margin:0 auto}
+.btn{background:var(--panel2);color:var(--fg);border:1px solid var(--line);border-radius:10px;padding:14px 10px;font-size:16px;cursor:pointer;user-select:none;transition:background .12s,border-color .12s,transform .05s;font-family:inherit}
+.btn:hover{background:#242c3d;border-color:#3a4557}
+.btn:active,.btn.held{background:var(--acc2);border-color:var(--acc);transform:scale(.96)}
+.btn.sm{padding:9px 10px;font-size:13px}
+.btn.pri{background:var(--acc2);border-color:var(--acc);color:#fff;font-weight:600}
+a.btn{text-decoration:none;display:inline-block;text-align:center}
+.btn.pri:hover{background:#2b7ff5}
+.center-cell{display:flex;align-items:center;justify-content:center;font-size:10px;color:var(--dim);letter-spacing:.1em;text-transform:uppercase}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.row+.row{margin-top:10px}
+label.f{display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--dim);flex:1;min-width:70px}
+input[type=text],input[type=number]{background:#0b0f16;color:var(--fg);border:1px solid var(--line);border-radius:8px;padding:9px 10px;font-size:13px;width:100%;font-family:inherit}
+input:focus{outline:none;border-color:var(--acc)}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:9px;overflow:hidden}
+.seg button{background:var(--panel2);color:var(--dim);border:0;padding:8px 12px;font-size:12px;cursor:pointer;font-family:inherit}
+.seg button.on{background:var(--acc2);color:#fff}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(146px,1fr));gap:9px}
+.pset{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:10px;display:flex;flex-direction:column;gap:7px}
+.pset.set{border-color:#2f5d3f}
+.pset .nm{font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pset .co{font-size:10px;color:var(--dim);font-variant-numeric:tabular-nums}
+.pset .acts{display:flex;gap:5px}
+.pset .acts button{flex:1;padding:7px 4px;font-size:11px;border-radius:7px}
+table.kv{width:100%;border-collapse:collapse;font-size:12px}
+table.kv td{padding:6px 0;border-bottom:1px solid rgba(42,50,66,.55);word-break:break-all}
+table.kv td:first-child{color:var(--dim);width:42%}
+table.kv tr:last-child td{border-bottom:0}
+.copy{cursor:pointer;color:var(--acc);border-bottom:1px dotted var(--acc)}
+.msg{position:fixed;left:50%;bottom:22px;transform:translateX(-50%) translateY(20px);background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:10px 16px;font-size:13px;opacity:0;transition:.22s;z-index:50;pointer-events:none;box-shadow:0 8px 30px rgba(0,0,0,.5);max-width:88vw}
+.msg.show{opacity:1;transform:translateX(-50%) translateY(0)}
+.msg.bad{border-color:var(--bad);color:var(--bad)}
+.hint{font-size:11px;color:var(--dim);line-height:1.6;margin-top:10px}
+hr{border:0;border-top:1px solid var(--line);margin:14px 0}
+.stack{display:grid;gap:12px}
+/* Inline modals instead of prompt()/confirm(): several in-app browsers and
+   WebViews return null from prompt(), which made "Save" do nothing at all. */
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.66);display:flex;align-items:center;justify-content:center;z-index:40;padding:18px}
+.modal .box{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px;max-width:340px;width:100%;box-shadow:0 12px 40px rgba(0,0,0,.55)}
+.modal h3{margin:0 0 4px;font-size:15px}
+.modal code{background:var(--panel2);padding:1px 5px;border-radius:4px;font-size:12px;color:var(--acc)}
+.pset input{padding:7px 8px}
+.pset .acts button.arm{background:var(--acc2);border-color:var(--acc);color:#fff}
+</style>
+</head>
+<body>
+<header>
+  <h1>&#9678; Anyka Cam</h1>
+  <span class="chip"><span class="dot" id="live"></span><span id="ip">connecting&hellip;</span></span>
+  <span class="chip">PAN <b id="cpos">--</b></span>
+  <span class="chip">TILT <b id="cpos2">--</b></span>
+  <span class="chip" id="uptime">up --</span>
+  <span class="chip" id="load">load --</span>
+  <!-- If this does not read "ui v22", the browser is running a cached page and
+       none of the fixes below are the ones you are clicking. -->
+  <span class="chip" id="uiver">ui v22</span>
+
+
+</header>
+
+<main>
+  <div class="stack">
+    <div class="card">
+      <h2>Live view <span class="sub">drag on the image to aim</span></h2>
+      <div class="stage" id="stage">
+        <div class="off" id="pvoff">Loading&hellip;</div>
+        <video id="lv" autoplay playsinline muted style="display:none"></video>
+        <img id="pv" alt="" style="display:none">
+        <div class="xhair" id="xh" style="display:none"></div>
+        <div class="posbadge">PAN <b id="bpos">--</b> &nbsp;TILT <b id="bpos2">--</b></div>
+      </div>
+      <div class="body">
+        <div class="row">
+          <button class="btn sm pri" id="lvbtn" style="flex:1">Start live preview</button>
+          <span class="chip" id="lvstat">relay off</span>
+        </div>
+        <div class="hint">A page may not open a raw TCP socket, so the camera's RTSP can never be played here
+          directly. What works: press this and the camera starts a small relay (<code>go2rtc</code> on the card) that
+          repackages the same H.264 into fragmented MP4 over HTTP, and <b>your</b> machine decodes it &mdash; nothing is
+          transcoded on the camera's 432&nbsp;MHz core. The relay is not running at boot: it comes up on the press and
+          shuts itself down a few minutes after the last viewer stops asking.</div>
+      </div>
+    </div>
+
+
+    <div class="card">
+      <h2>Recorded positions <span class="sub" id="pcount"></span></h2>
+      <div class="body">
+        <div class="grid" id="presets"></div>
+        <div class="hint">Stored on the camera, so they survive a reboot and are shared by every browser.
+          <b>Go</b> drives there; <b>Save</b> overwrites the slot with wherever the camera is pointing right now.</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="stack">
+    <div class="card">
+      <h2>Pan / Tilt</h2>
+      <div class="body">
+        <div class="pad">
+          <button class="btn" data-dir="ul">&#8598;</button>
+          <button class="btn" data-dir="up">&#8593;</button>
+          <button class="btn" data-dir="ur">&#8599;</button>
+          <button class="btn" data-dir="left">&#8592;</button>
+          <div class="center-cell">aim</div>
+          <button class="btn" data-dir="right">&#8594;</button>
+          <button class="btn" data-dir="dl">&#8601;</button>
+          <button class="btn" data-dir="down">&#8595;</button>
+          <button class="btn" data-dir="dr">&#8600;</button>
+        </div>
+        <div class="row" style="justify-content:center;margin-top:14px">
+          <span style="font-size:11px;color:var(--dim)">step</span>
+          <span class="seg" id="stepsel">
+            <button data-s="2">2&deg;</button><button data-s="5">5&deg;</button><button data-s="10" class="on">10&deg;</button><button data-s="30">30&deg;</button>
+          </span>
+        </div>
+        <hr>
+        <div class="row">
+          <label class="f">Pan<input type="number" id="gpan" inputmode="numeric"></label>
+          <label class="f">Tilt<input type="number" id="gtilt" inputmode="numeric"></label>
+        </div>
+        <div class="row">
+          <button class="btn sm pri" id="gobtn" style="flex:1">Go to position</button>
+          <button class="btn sm" id="homebtn">Home</button>
+        </div>
+        <div class="hint">Hold a direction to repeat. Every step is an absolute move computed from the position the
+          camera reports, so the gimbal cannot drift out of sync the way fixed 10&deg; nudges do.</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Patrol</h2>
+      <div class="body">
+        <div class="row">
+          <button class="btn sm" id="tourbtn" style="flex:1">Start patrol</button>
+          <label class="f" style="max-width:88px">dwell s<input type="number" id="toursec" value="12" min="3" inputmode="numeric"></label>
+        </div>
+        <div class="hint">Cycles through the saved positions in slot order while the page is open.</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Camera</h2>
+      <div class="body">
+        <div class="row">
+          <button class="btn sm" id="ledbtn">White LED</button>
+          <button class="btn sm" id="shotbtn">Save snapshot</button>
+        </div>
+        <hr>
+        <div class="row">
+          <label class="f">Preview URL (empty = off)<input type="text" id="pvset" placeholder="http://192.168.10.70:8124/preview.jpg"></label>
+        </div>
+        <div class="row">
+          <button class="btn sm" id="pvsave" style="flex:1">Save preview URL</button>
+        </div>
+        <div class="hint">This URL is only for a JPEG snapshot pulled from some machine on your network
+          (<code>tools/relay.py</code>). The live video above needs neither: it comes from the camera's own relay.
+          Empty means snapshot-off, live preview still works.</div>
+        <hr>
+        <div class="row">
+          <button class="btn sm" id="lvoffbtn" style="flex:1">Stop relay now</button>
+          <button class="btn sm" id="lvtoggle">Relay: allowed</button>
+        </div>
+        <div class="hint"><b>Stop relay now</b> frees the camera's RAM for every viewer at once.
+          <b>Relay: allowed/blocked</b> is a switch on the card (<code>/mnt/camweb/live/disable</code>): while blocked
+          the Live button refuses and nothing starts, and the choice survives a reboot.</div>
+        <hr>
+        <table class="kv">
+          <tr><td>RTSP main</td><td><span class="copy" id="rt1">--</span></td></tr>
+          <tr><td>RTSP sub</td><td><span class="copy" id="rt2">--</span></td></tr>
+          <tr><td>Live relay</td><td id="lvinfo">--</td></tr>
+          <tr><td>Relay web UI</td><td><a class="copy" id="lvui" href="#" target="_blank" rel="noopener">--</a></td></tr>
+          <tr><td>RTSP out (relay)</td><td><span class="copy" id="lvrtsp">--</span></td></tr>
+          <tr><td>Memory free</td><td id="mem">--</td></tr>
+          <tr><td>Wi-Fi link</td><td id="wifi">--</td></tr>
+          <tr><td>Kernel</td><td id="kern">--</td></tr>
+        </table>
+
+        <div class="row" style="margin-top:12px">
+          <button class="btn sm" id="chtok">Change token</button>
+          <button class="btn sm warn" id="rebootbtn">Reboot camera</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</main>
+<div class="msg" id="msg"></div>
+
+
+<div class="msg" id="msg"></div>
+<div class="modal" id="login" style="display:none">
+  <div class="box">
+    <h3>Camera access token</h3>
+    <p class="hint" style="margin:0 0 12px">This is the contents of <code>/mnt/camweb/token</code> on the card. It is kept in this browser only.</p>
+    <input type="text" id="tokin" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="token">
+    <div class="row" style="margin-top:12px">
+      <button class="btn pri sm" id="tokgo" style="flex:1">Unlock</button>
+      <button class="btn sm" id="tokcancel" style="flex:1">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<script src="app.js?v=22"></script>
+
+</body>
+</html>
