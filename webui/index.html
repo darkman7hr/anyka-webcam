@@ -186,6 +186,27 @@ hr{border:0;border-top:1px solid var(--line);margin:14px 0}
         </div>
         <hr>
         <div class="row">
+          <span class="hint" style="flex:1">Image mode (ISP)</span>
+          <button class="btn sm" id="ndday">Day</button>
+          <button class="btn sm" id="ndnight">Night</button>
+          <button class="btn sm" id="ndauto">Auto</button>
+        </div>
+        <div class="hint" id="ndinfo">image mode: reading&hellip;</div>
+        <div class="hint">Night is the mode that measures neutral under this camera's own infrared light
+          (R=G=B across 0..255); the same scene through a day-mode ISP measures R-G +76, B-G +79 &mdash; that is
+          the purple picture. The change is applied while the stream keeps running, and it is remembered across
+          restarts. Auto trusts the light sensor, and this sensor reports DAY in a dark IR-lit room because the
+          illuminator lights it, so auto is a choice here, not the default.</div>
+        <div class="row">
+          <button class="btn sm" id="irbtn">IR illuminator</button>
+          <button class="btn sm" id="cutbtn">IR-cut filter</button>
+        </div>
+        <div class="hint">Two different things. The illuminator is a gpio and switches instantly (measured: mean
+          luminance 142 &rarr; 127 with it off, automatic gain taking some of that back). The filter is mechanical
+          and takes a couple of seconds to travel; with the illuminator on it measured mean 44 against 136, so
+          leaving the room lit only by IR and putting the filter in will look like the picture went blind.</div>
+        <hr>
+        <div class="row">
           <label class="f">Preview URL (empty = off)<input type="text" id="pvset" placeholder="http://192.168.10.70:8124/preview.jpg"></label>
         </div>
         <div class="row">

@@ -26,21 +26,38 @@
 # a word grep matches this script's own argv).
 export LD_LIBRARY_PATH=/mnt/Factory/custom/lib
 
+# Started by /mnt/Factory/config.sh at boot, where it inherits the boot
+# environment rather than an interactive shell's. Without this the loop can be
+# running with a PATH that finds no grep/netstat and silently do nothing - the
+# same trap the web CGI documents.
+PATH="/bin:/usr/bin:/sbin:/usr/sbin${PATH:+:$PATH}"
+export PATH
+
 INTERVAL=${1:-10}
 MAXFAILS=${2:-3}
 # Paths come from the environment so the failure paths can be exercised on a bench
 # run with an isolated pidfile and log instead of this camera's live ones:
 #   BIN=/tmp/nothing PIDF=/tmp/t_sup.pid SUP=/tmp/t_sup.log sh /tmp/run_akrtsp.sh 2 1
-BIN=${BIN:-/tmp/akrtsp}
+# BIN defaults to wherever this build is installed, not to one hard-coded path:
+# the same script has to be right from /tmp during an experiment and from the card
+# at boot. A supervisor that cannot find its binary falls back to the vendor
+# server, and if the default were wrong that would happen quietly on every boot.
+if [ -z "$BIN" ]; then
+  if [ -x /mnt/camrtsp/akrtsp ]; then BIN=/mnt/camrtsp/akrtsp; else BIN=/tmp/akrtsp; fi
+fi
 LOG=${LOG:-/tmp/akrtsp.log}
 SUP=${SUP:-/tmp/akrtsp_sup.log}
 PIDF=${PIDF:-/tmp/akrtsp_sup.pid}
-AK_ARGS=${AK_ARGS:---force-night night}
+AK_ARGS=${AK_ARGS:---mode-file /mnt/camweb/daynight.conf --force-night night}
 
 pids_by_comm()
 {
+	# `read' is a shell builtin: `$(cat /proc/$p/comm)' would fork once per
+	# process, ~100 forks per round, and this loop runs every round.
 	for p in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
-		[ "$(cat /proc/$p/comm 2>/dev/null)" = "$1" ] && echo "$p"
+		[ -r "/proc/$p/comm" ] || continue
+		read -r c < "/proc/$p/comm"
+		[ "$c" = "$1" ] && echo "$p"
 	done
 }
 

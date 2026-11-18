@@ -104,6 +104,27 @@ static int g_force_night = -1;		/* --force-night day|night, for A/B measuring */
 static int g_mode = -1;			/* 1 day, 0 night, -1 not decided yet */
 static int g_have_ir;			/* did ak_drv_ir_init() give us the filter? */
 
+/*
+ * Control and status files, so the web UI can change the mode without a restart
+ * and without a second daemon holding the capture pipeline.
+ *
+ * The control file is the desired state, one word: "day", "night" or "auto". The
+ * web CGI writes it, this thread reads it every few seconds. It is deliberately a
+ * plain file rather than a socket or a signal: it can be read and written from
+ * ash, from the CGI, from a terminal, and it survives a restart of the server, so
+ * the mode a person chose on the card outlives the process that applied it. The
+ * file wins over --force-night when it says something valid; that flag is only the
+ * fallback for when there is no file, which is what makes an A/B run on /tmp still
+ * possible without deleting the deployment's setting.
+ *
+ * The status file is written here and read by the CGI: current mode, what was
+ * asked for, the light sensor reading, fps, clients, frame counters. It is written
+ * through a temp name and renamed, so the CGI never reads a half-written file.
+ */
+static char g_mode_file[160] = "/tmp/akrtsp.cmd";
+static char g_status_file[160] = "/tmp/akrtsp.status";
+static int g_mode_want = -1;		/* last thing the control file asked for */
+
 static void logmsg(const char *fmt, ...)
 {
 	va_list ap;
@@ -722,6 +743,74 @@ static void pipeline_open(void)
  * our RTP timestamps off by that ratio, so fps is re-asserted after every
  * switch and rtsp_probe.py is what proves it stayed honest.
  */
+static int mode_word(const char *w)
+{
+	if (!strcmp(w, "day"))
+		return 1;
+	if (!strcmp(w, "night"))
+		return 0;
+	if (!strcmp(w, "auto"))
+		return 2;
+	return -1;
+}
+
+/*
+ * The desired day/night state, as written by the web CGI: 1 day, 0 night, 2 auto,
+ * -1 for "no file" or "something I cannot use". Returning -1 without changing
+ * anything is deliberate: a half-written or mistyped file must never move the ISP,
+ * because the wrong mode here is the difference between a usable picture and a
+ * black one.
+ */
+static int read_mode_file(const char *path, char *word, int cap)
+{
+	char raw[96];
+	FILE *f = fopen(path, "r");
+	int got = -1;
+
+	if (!f)
+		return -1;
+	if (fgets(raw, sizeof raw, f) && sscanf(raw, "%31s", word) == 1) {
+		word[cap - 1] = 0;
+		got = mode_word(word);
+	}
+	fclose(f);
+	return got;
+}
+
+/*
+ * What the UI shows. Written to a temp name and renamed, so a CGI reading this
+ * between two fprintf() calls cannot see a truncated line.
+ */
+static void write_status(int want, int ldr)
+{
+	char path[200];
+	FILE *f;
+	int i, clients = 0;
+
+	for (i = 0; i < MAX_SESS; i++)
+		if (g_sess[i].used)
+			clients++;
+
+	snprintf(path, sizeof path, "%s.tmp", g_status_file);
+	f = fopen(path, "w");
+	if (!f)
+		return;
+	fprintf(f,
+		"pid=%d\nmode=%s\nwant=%s\nldr=%d\nir_init=%d\nfps=%d,%d\ngop=%d\n"
+		"clients=%d\nframes=%ld,%ld\nkeys=%ld,%ld\nbytes=%ld,%ld\n",
+		(int)getpid(),
+		g_mode < 0 ? "unset" : (g_mode ? "day" : "night"),
+		want < 0 ? "none" : (want == 2 ? "auto" : (want ? "day" : "night")),
+		ldr, g_have_ir,
+		g_prof[CH_MAIN].fps, g_prof[CH_SUB].fps, g_prof[CH_MAIN].gop,
+		clients,
+		g_prof[CH_MAIN].frames, g_prof[CH_SUB].frames,
+		g_prof[CH_MAIN].keyframes, g_prof[CH_SUB].keyframes,
+		g_prof[CH_MAIN].bytes, g_prof[CH_SUB].bytes);
+	fclose(f);
+	rename(path, g_status_file);
+}
+
 static void apply_mode(int mode, const char *why)
 {
 	int r = ak_vi_switch_mode(g_vi, mode ? VI_MODE_DAY : VI_MODE_NIGHT);
@@ -747,9 +836,25 @@ static void apply_mode(int mode, const char *why)
 		       g_prof[CH_MAIN].fps);
 }
 
+/*
+ * The day/night thread. It now always runs (unless --mode-file "" is given),
+ * because its job is no longer only deciding: it applies what the control file
+ * asks for and publishes the status the UI reads.
+ *
+ * Order of precedence, measured rather than assumed - see the comment above
+ * apply_mode() for why the light sensor is the weakest of these:
+ *
+ *   the control file ("day"/"night")   wins; this is what the web UI writes
+ *   --force-night                       only when the file says nothing usable
+ *   "auto" in the file, or --auto-night the light sensor, knowing it lies indoors
+ *
+ * A file that cannot be read, or says something unrecognised, changes nothing:
+ * the mode that produced a visible picture stays until someone asks for another.
+ */
 static void *light_watch(void *unused)
 {
-	int secs = 0;
+	char word[32];
+	int secs, want, ldr, auto_wanted;
 
 	(void)unused;
 	g_have_ir = (ak_drv_ir_init() == 0);
@@ -757,35 +862,26 @@ static void *light_watch(void *unused)
 		logmsg("day/night: ak_drv_ir_init failed - the mechanical filter stays "
 		       "with ptz_daemon; only the ISP mode will be switched\n");
 
-	/*
-	 * This build has no image-based day/night query (ak_vpss_isp_get_auto_day_night_level
-	 * exists only in newer SDK dumps; the libplat_vpss on this board does not export
-	 * it), so the decision has two sources and neither is the picture itself:
-	 *
-	 *   the ISP's own statistics, if --auto-fps left the library's auto switch on
-	 *   the light dependent resistor, which is what ak_drv_ir_get_input_level reads
-	 *
-	 * The LDR is the weaker of the two and this camera proves why: with the room dark
-	 * and the camera's own IR illuminator on it sits at the far side of the day
-	 * threshold (read 1, thresholds day min=1000 max=2000 / night max=618) because the
-	 * illuminator lights the resistor it is mounted next to. It can therefore tell day
-	 * from night outdoors, and cannot tell them indoors with the IR led on. That is
-	 * why the ISP's own statistics are preferred whenever they are enabled.
-	 */
-	if (g_force_night >= 0) {
-		apply_mode(g_force_night, "--force-night");
-		while (g_run)
-			sleep(1);
-		return NULL;
-	}
-
 	while (g_run) {
-		int ldr = g_have_ir ? ak_drv_ir_get_input_level() : -1;
+		word[0] = 0;
+		want = read_mode_file(g_mode_file, word, sizeof word);
+		g_mode_want = want;
+		ldr = g_have_ir ? ak_drv_ir_get_input_level() : -1;
+		auto_wanted = g_auto_night || want == 2;
 
-		if (ldr >= 0 && ldr != g_mode) {
-			logmsg("day/night: ldr says %d\n", ldr);
+		if (want == 0 || want == 1) {
+			if (want != g_mode)
+				apply_mode(want, "control file");
+		} else if (g_mode < 0 && g_force_night >= 0) {
+			apply_mode(g_force_night, "--force-night");
+		} else if (auto_wanted && ldr >= 0 && ldr != g_mode) {
+			logmsg("day/night: ldr says %d%s\n", ldr,
+			       want == 2 ? " (control file asked for auto)" : "");
 			apply_mode(ldr, "light sensor");
 		}
+
+		write_status(want, ldr);
+
 		/* Poll in 1 s slices so a stop is honoured promptly. */
 		for (secs = 0; secs < 5 && g_run; secs++)
 			sleep(1);
@@ -1202,6 +1298,7 @@ static void usage(const char *argv0)
 		"         [--main 1280x720] [--sub 640x480]\n"
 		"         [--main-kbps 1500] [--sub-kbps 600] [--verbose]\n"
 		"         [--force-night day|night] [--auto-night] [--ir-follow] [--auto-fps]\n"
+		"         [--mode-file /tmp/akrtsp.cmd] [--status-file /tmp/akrtsp.status]\n"
 		"\n"
 		"gop is clamped to at least fps: libakstreamenc dies with SIGFPE at the\n"
 		"second keyframe when the GOP is shorter than a second.\n"
@@ -1212,12 +1309,16 @@ static void usage(const char *argv0)
 		"\"switching isp mode -> night\". Nothing on this board decides that reliably:\n"
 		"libplat_vi's auto path never switched by itself (90 s measured), the light\n"
 		"sensor reports DAY in a dark IR-lit room, and the ISP's own statistics are\n"
-		"exported by libakispsdk without any header declaring them. So switching is\n"
-		"opt-in: --force-night picks a mode and means it (this camera: night),\n"
-		"--auto-night trusts the light sensor, --ir-follow also moves the mechanical\n"
+		"exported by libakispsdk without any header declaring them. So the mode is\n"
+		"asked for, not guessed: the control file (--mode-file) holds one word -\n"
+		"day, night or auto - and wins over --force-night, which is only the default\n"
+		"for when there is no file (this camera: night). --auto-night or \"auto\" in\n"
+		"the file trusts the light sensor, --ir-follow also moves the mechanical\n"
 		"filter (measured to blind the camera when the sensor lies), --auto-fps hands\n"
 		"light adaptation to libplat_vi's thread, which changes the sensor fps that\n"
-		"our fixed-step RTP timestamps do not yet follow.\n", argv0);
+		"our fixed-step RTP timestamps do not yet follow.\n"
+		"The status file is rewritten every 5 s for the web UI: current mode, what\n"
+		"was asked for, the light sensor, fps, clients and frame counters.\n", argv0);
 }
 
 static int parse_size(const char *s, int *w, int *h)
@@ -1241,6 +1342,7 @@ int main(int argc, char **argv)
 		{ "no-night", 0, 0, 'N' }, { "force-night", 1, 0, 'n' },
 		{ "auto-night", 0, 0, 'A' }, { "ir-follow", 0, 0, 'f' },
 		{ "auto-fps", 0, 0, 'a' },
+		{ "mode-file", 1, 0, 'm' }, { "status-file", 1, 0, 's' },
 		{ "verbose", 0, 0, 'v' }, { "help", 0, 0, 'h' }, { 0, 0, 0, 0 }
 	};
 
@@ -1251,7 +1353,7 @@ int main(int argc, char **argv)
 	g_prof[CH_SUB].w = 640;
 	g_prof[CH_SUB].h = 480;
 
-	while ((c = getopt_long(argc, argv, "p:F:G:M:S:b:k:n:aNAfvh", longopts, NULL)) != -1) {
+	while ((c = getopt_long(argc, argv, "p:F:G:M:S:b:k:n:aNAfm:s:vh", longopts, NULL)) != -1) {
 		switch (c) {
 		case 'p': port = atoi(optarg); break;
 		case 'F': fps = atoi(optarg); break;
@@ -1264,6 +1366,12 @@ int main(int argc, char **argv)
 		case 'A': g_auto_night = 1; break;
 		case 'f': g_ir_follow = 1; break;
 		case 'a': g_auto_fps = 1; break;
+		case 'm':
+			snprintf(g_mode_file, sizeof g_mode_file, "%s", optarg);
+			break;
+		case 's':
+			snprintf(g_status_file, sizeof g_status_file, "%s", optarg);
+			break;
 		case 'n':
 			if (!strcmp(optarg, "day"))
 				g_force_night = 1;
@@ -1319,18 +1427,23 @@ int main(int argc, char **argv)
 		if (pthread_create(&prod_th[ch], NULL, producer, &g_prof[ch]) != 0)
 			die("pthread_create producer %s\n", g_prof[ch].name);
 	}
-	if (g_auto_night || g_force_night >= 0) {
-		if (pthread_create(&light_th, NULL, light_watch, NULL) != 0)
-			logmsg("day/night: cannot start the light thread; the ISP will stay "
-			       "in the mode it booted into\n");
-		else
-			light_on = 1;
-	} else {
-		logmsg("day/night: not switching automatically. Left in day mode under this "
+	/*
+	 * The day/night thread always runs: it applies the control file, falls back to
+	 * --force-night when there is none, and writes the status file the web UI reads.
+	 * --auto-night is no longer what turns it on, so a mode can be changed from the
+	 * browser without restarting the server.
+	 */
+	if (pthread_create(&light_th, NULL, light_watch, NULL) != 0)
+		logmsg("day/night: cannot start the light thread; the ISP will stay "
+		       "in the mode it booted into and there will be no status file\n");
+	else
+		light_on = 1;
+	if (g_force_night < 0 && !g_auto_night)
+		logmsg("day/night: no mode asked for yet. Left in day mode under this "
 		       "camera's own IR illuminator the picture is magenta (mean R-G +76, "
-		       "B-G +79); --force-night night fixes that, --auto-night would trust "
-		       "the light sensor, which reports DAY here even in the dark.\n");
-	}
+		       "B-G +79); write 'night' to %s, or use --force-night night. The "
+		       "light sensor reports DAY here even in the dark, so 'auto' is not "
+		       "a safe default indoors.\n", g_mode_file);
 
 	printf("akrtsp on :%d  (rtsp://<camera>:%d/vs1 = %dx%d@%d, /vs0 = %dx%d@%d)\n",
 		port, port, g_prof[CH_SUB].w, g_prof[CH_SUB].h, fps,

@@ -23,11 +23,13 @@ export LD_LIBRARY_PATH=/mnt/Factory/custom/lib
 # Extra flags for akrtsp. The default is deliberate, not incidental: this camera
 # sits in a dark room lit by its own IR illuminator, and the ISP boots in DAY mode,
 # which renders infrared as magenta (measured R-G +76, B-G +79 against R=G=B in
-# night mode). Override for an A/B run with AK_ARGS="..." in the environment; do
-# NOT add --auto-night or --ir-follow here - the light sensor reports DAY in this
-# room (the illuminator lights the resistor), and acting on it inserts the IR-cut
-# filter and blinds the camera. See README, "The purple image".
-AK_ARGS=${AK_ARGS:---force-night night}
+# night mode). --mode-file is the file the web UI writes; it wins over
+# --force-night whenever it holds a valid word, so the mode a person chose on the
+# card outlives the process. Override for an A/B run with AK_ARGS="..." in the
+# environment; do NOT add --auto-night or --ir-follow here - the light sensor
+# reports DAY in this room (the illuminator lights the resistor), and acting on it
+# inserts the IR-cut filter and blinds the camera. See README, "The purple image".
+AK_ARGS=${AK_ARGS:---mode-file /mnt/camweb/daynight.conf --force-night night}
 
 # Match processes by /proc/<pid>/comm, never by grepping ps: the vendor binary
 # runs as /mnt/Factory/custom/rtsp from the init scripts but as "./rtsp" when
@@ -35,8 +37,12 @@ AK_ARGS=${AK_ARGS:---force-night night}
 # the capture device so every later start fails with "Device or resource busy".
 pids_by_comm()
 {
+	# `read' is a builtin: `$(cat /proc/$p/comm)' forks once per process, and
+	# these loops run in poll cycles on a single-core box.
 	for p in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
-		[ "$(cat /proc/$p/comm 2>/dev/null)" = "$1" ] && echo "$p"
+		[ -r "/proc/$p/comm" ] || continue
+		read -r c < "/proc/$p/comm"
+		[ "$c" = "$1" ] && echo "$p"
 	done
 }
 rtsp_pids()

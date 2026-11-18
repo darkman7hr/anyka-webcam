@@ -31,6 +31,27 @@ LSTATE=/tmp/live_state
 LSTOPF=/tmp/live_stopflag
 LREADY=/tmp/live_ready
 
+# Day/night and IR. Three different things, and the UI has to say so:
+#   the ISP mode  (day/night)  - written to DAYNIGHT_FILE, applied by akrtsp's
+#                                light thread within ~5 s without a restart. This
+#                                is what fixes the magenta picture: a day-mode ISP
+#                                under this camera's own IR light measures R-G +76,
+#                                night mode R=G=B.
+#   the illuminator (IR_LED)   - a gpio, /sys/user-gpio/IR_LED, world-writable.
+#                                Measured on this camera: switching it off moved
+#                                75% of the pixels of a static frame (mean |diff|
+#                                27.5) and the frame mean fell 142 -> 127.
+#   the IR-cut filter (ircut)  - mechanical; handled through ptz_daemon below,
+#                                which drives the motor. Inserting it in an IR-lit
+#                                room measured mean 44 against 136 with it out.
+# akrtsp publishes /tmp/akrtsp.status (mode actually in force, light sensor, fps,
+# clients, frame counters); it is written through a temp name and renamed, so
+# reading it here cannot catch a half-written line.
+DNF=${DAYNIGHT_FILE:-/mnt/camweb/daynight.conf}
+AKST=${AKRTSP_STATUS:-/tmp/akrtsp.status}
+IRLED=${IRLED_NODE:-/sys/user-gpio/IR_LED}
+IRCUTN=${IRCUT_NODE:-/sys/user-gpio/gpio-ircut_a}
+
 
 
 # Once httpd is started by /mnt/Factory/config.sh at boot it inherits the boot
@@ -101,6 +122,74 @@ get_pos() {
     set -- $(cat "$POS" 2>/dev/null)
     if is_int "$1" && is_int "$2"; then P_PAN=$1; P_TILT=$2; fi
   fi
+}
+
+
+# ak_pid - the stream server's pid, from the pid it publishes in its own status
+# file. This used to walk /proc and `cat' every comm, which is one fork per
+# process: on this box that is ~100 forks per status poll, and with a browser
+# polling the page every few seconds the camera measured 0% idle and a load
+# average of 11 - the monitoring was costing more than the streaming. So: read the
+# pid the server writes, then confirm it with the shell's own `read' (a builtin,
+# no fork). Only if the status file is gone does it fall back to a scan, and that
+# scan uses `read' too.
+ak_pid() {
+  if [ -r "$AKST" ]; then
+    p=$(awk -F= '$1=="pid"{print $2; exit}' "$AKST" 2>/dev/null)
+    if [ -n "$p" ] && [ -r "/proc/$p/comm" ]; then
+      read c < "/proc/$p/comm"
+      [ "$c" = akrtsp ] && { printf '%s' "$p"; return 0; }
+    fi
+  fi
+  for p in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+    [ -r "/proc/$p/comm" ] || continue
+    read c < "/proc/$p/comm"
+    if [ "$c" = akrtsp ]; then printf '%s' "$p"; return 0; fi
+  done
+  return 1
+}
+
+# node_val <path> - one character from a gpio node, "?" if it cannot be read.
+# The Anyka nodes return more than a digit if cat'd whole, hence head -c 1.
+node_val() {
+  v=$(head -c 1 "$1" 2>/dev/null)
+  case "$v" in 0|1) printf '%s' "$v" ;; *) printf '?' ;; esac
+}
+
+# st_val <key> <default> - one field from akrtsp's status file.
+st_val() {
+  if [ ! -r "$AKST" ]; then printf '%s' "$2"; return; fi
+  v=$(awk -F= -v k="$1" '$1==k{print $2; exit}' "$AKST" 2>/dev/null)
+  if [ -n "$v" ]; then printf '%s' "$v"; else printf '%s' "$2"; fi
+}
+
+# light_json - the day/night and IR block, shared by status and by the actions
+# that change them, so the page can re-read exactly what it just asked for and
+# see whether it took effect.
+#
+# One awk pass over the status file rather than one per field, and no `cat' per
+# /proc entry: this endpoint is what the page polls every few seconds, and the
+# fork-happy first version of it drove the camera to 0% idle with a browser open.
+light_json() {
+  want=$(head -c 8 "$DNF" 2>/dev/null)
+  case "$want" in day|night|auto) : ;; *) want=unset ;; esac
+  mode=unset; ldr=-1; clients=0; apid=; fps=?
+  if [ -r "$AKST" ]; then
+    set -- $(awk -F= 'BEGIN{m="unset";l=-1;c=0;p="";f="?"} \
+        $1=="mode"{m=$2} $1=="ldr"{l=$2} $1=="clients"{c=$2} $1=="pid"{p=$2} \
+        $1=="fps"{f=$2} END{print m,l,c,p,f}' "$AKST" 2>/dev/null)
+    mode=${1:-unset}; ldr=${2:--1}; clients=${3:-0}; apid=${4:-}; fps=${5:-?}
+  fi
+  run=0
+  if [ -n "$apid" ] && [ -r "/proc/$apid/comm" ]; then
+    read c < "/proc/$apid/comm"
+    [ "$c" = akrtsp ] && run=1
+  fi
+  if [ "$run" = 0 ] && ak_pid >/dev/null; then run=1; fi
+  printf '"night_set":"%s","night_mode":"%s","ldr":%s,"ir_led":"%s","ircut":"%s","akrtsp":%s,"ak_pid":"%s","ak_fps":"%s","ak_clients":%s' \
+    "$want" "$mode" "$ldr" \
+    "$(node_val "$IRLED")" "$(node_val "$IRCUTN")" \
+    "$run" "${apid:-?}" "$fps" "$clients"
 }
 
 
@@ -321,7 +410,7 @@ case "$act" in
     ip=$(ip route get 1 2>/dev/null | awk '{print $NF;exit}')
     case "$ip" in *.*) : ;; *) ip=$(ifconfig wlan0 2>/dev/null | grep 'inet addr' | cut -d: -f2 | cut -d' ' -f1) ;; esac
     rs=$(awk '/wlan0/{gsub(/\./,"",$3); gsub(/\./,"",$4); print $3"|"$4}' /proc/net/wireless 2>/dev/null | head -1)
-    echo "{\"ok\":1,\"pan\":$P_PAN,\"tilt\":$P_TILT,\"uptime\":${up:-0},\"load\":\"${ld:-?}\",\"mem_total\":${mt:-0},\"mem_free\":${mf:-0},\"ip\":\"$(esc "$ip")\",\"link\":\"$(esc "$rs")\",\"pan_min\":$PAN_MIN,\"pan_max\":$PAN_MAX,\"tilt_min\":$TILT_MIN,\"tilt_max\":$TILT_MAX,\"step\":$STEP_DEF,\"preview_url\":\"$(esc "$PREVIEW_URL")\",\"live_en\":${LIVE_EN:-1},\"live_off\":$(if [ -f $LIVE/disable ]; then echo 1; else echo 0; fi),\"live_running\":$(if live_alive $LG2F >/dev/null; then echo 1; else echo 0; fi),\"live_port\":$LIVE_API_PORT,\"live_rtsp_port\":$LIVE_RTSP_PORT}"
+    echo "{\"ok\":1,\"pan\":$P_PAN,\"tilt\":$P_TILT,\"uptime\":${up:-0},\"load\":\"${ld:-?}\",\"mem_total\":${mt:-0},\"mem_free\":${mf:-0},\"ip\":\"$(esc "$ip")\",\"link\":\"$(esc "$rs")\",\"pan_min\":$PAN_MIN,\"pan_max\":$PAN_MAX,\"tilt_min\":$TILT_MIN,\"tilt_max\":$TILT_MAX,\"step\":$STEP_DEF,\"preview_url\":\"$(esc "$PREVIEW_URL")\",\"live_en\":${LIVE_EN:-1},\"live_off\":$(if [ -f $LIVE/disable ]; then echo 1; else echo 0; fi),\"live_running\":$(if live_alive $LG2F >/dev/null; then echo 1; else echo 0; fi),\"live_port\":$LIVE_API_PORT,\"live_rtsp_port\":$LIVE_RTSP_PORT,$(light_json)}"
     ;;
 
   ptz)
@@ -415,13 +504,46 @@ case "$act" in
 
   ircut)
     # Mechanical, several seconds of travel, and it parks visibly if left
-    # half-way -- exposed deliberately, but one press at a time.
+    # half-way -- exposed deliberately, but one press at a time. Goes through
+    # ptz_daemon, which is what drives the motor; the gpio node is reported back
+    # so the page can show where the filter actually is rather than what was last
+    # asked for. Measured on this camera: filter in mean 44, filter out mean 136.
     case "$state" in
       1) ptz_send "irinit"; ptz_send "irsetircut 1" ;;
       0) ptz_send "irinit"; ptz_send "irsetircut 0" ;;
       *) echo '{"ok":0,"err":"bad state"}'; exit 0 ;;
     esac
-    echo '{"ok":1}'
+    echo "{\"ok\":1,\"ircut\":\"$(node_val "$IRCUTN")\"}"
+    ;;
+
+  nightmode)
+    # The ISP day/night mode, for the stream the NVR records and the preview
+    # shows. One word into the control file akrtsp polls every 5 s; it applies it
+    # without restarting, so the picture changes while the stream keeps running.
+    # Written through a temp name and renamed, because a half-written word read by
+    # the server could otherwise be "n" or "ni" - and the wrong mode here is the
+    # difference between a usable picture and a black one.
+    case "$state" in
+      day|night|auto) : ;;
+      *) echo '{"ok":0,"err":"state must be day, night or auto"}'; exit 0 ;;
+    esac
+    if ! printf '%s\n' "$state" > "$DNF.tmp" 2>/dev/null; then
+      echo "{\"ok\":0,\"err\":\"cannot write $DNF\"}"; exit 0
+    fi
+    mv -f "$DNF.tmp" "$DNF" 2>/dev/null || { echo "{\"ok\":0,\"err\":\"cannot move to $DNF\"}"; exit 0; }
+    echo "{\"ok\":1,$(light_json)}"
+    ;;
+
+  irled)
+    # The infrared illuminator, not the white lamp (that is act=led) and not the
+    # filter (that is act=ircut). A gpio: no travel time, no daemon involved.
+    case "$state" in
+      1|on)  echo 1 > "$IRLED" 2>/dev/null ;;
+      0|off) echo 0 > "$IRLED" 2>/dev/null ;;
+      get)   : ;;
+      *) echo '{"ok":0,"err":"state must be on, off or get"}'; exit 0 ;;
+    esac
+    echo "{\"ok\":1,$(light_json)}"
     ;;
 
   live_start)

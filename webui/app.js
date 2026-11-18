@@ -3,7 +3,7 @@
    RAM and already runs at a load average near 2. */
 var API = "cgi-bin/api";
 var tok = localStorage.getItem("camtok") || "";
-var st = { pan: null, tilt: null, pmin: 0, pmax: 360, tmin: 10, tmax: 170, step: 10, preview: "" };
+var st = { pan: null, tilt: null, pmin: 0, pmax: 360, tmin: 10, tmax: 170, step: 10, preview: "", night: {} };
 var presets = [], tour = null, tourIx = -1;
 var FOV = parseFloat(localStorage.getItem("camfov") || "62");
 
@@ -98,6 +98,7 @@ function poll() {
     var host = j.ip || location.hostname;
     $("rt1").textContent = "rtsp://" + host + ":554/vs0";
     $("rt2").textContent = "rtsp://" + host + ":554/vs1";
+    renderNight(j);
     $("rtspalt").textContent = "rtsp://" + host + ":554/vs0";
     if (typeof j.live_port !== "undefined") lvPollStatus(j);
   }).catch(function () { $("live").className = "dot"; });
@@ -989,6 +990,74 @@ document.addEventListener("visibilitychange", function () {
 });
 
 /* ---------- camera panel ---------- */
+
+/*
+ * Day/night and IR. Three separate controls because they are three separate
+ * things on this board, and the page has to show what is true rather than what
+ * was last clicked:
+ *   night_set   what was asked for (the control file on the card)
+ *   night_mode  what the ISP is actually in, reported by akrtsp itself
+ * If they differ, the change is in flight (akrtsp polls every 5 s) - or the
+ * stream server is not running, which the line says out loud.
+ */
+function renderNight(j) {
+  var b;
+  if (!$("ndinfo")) return;                 // page without this panel
+  st.night = j;
+
+  var set = j.night_set || "unset";
+  Array.prototype.forEach.call([["ndday", "day"], ["ndnight", "night"], ["ndauto", "auto"]],
+    function (p) { b = $(p[0]); if (b) b.className = "btn sm" + (set === p[1] ? " pri" : ""); });
+
+  var ldr = (j.ldr === 1) ? "day" : (j.ldr === 0 ? "night" : "n/a");
+  var led = (j.ir_led === "1") ? "on" : (j.ir_led === "0" ? "off" : "?");
+  var cut = (j.ircut === "1") ? "in" : (j.ircut === "0" ? "out" : "?");
+  var note = "";
+  if (!j.akrtsp) note = " - stream server not running";
+  else if (set !== "unset" && set !== "auto" && set !== j.night_mode) note = " - applying";
+  $("ndinfo").textContent = "asked: " + set + "  |  ISP now: "
+    + (j.night_mode || "unset") + "  |  light sensor: " + ldr
+    + "  |  IR led: " + led + "  |  filter: " + cut + note;
+
+  b = $("irbtn"); if (b) b.textContent = "IR illuminator: " + led;
+  b = $("cutbtn"); if (b) b.textContent = "IR-cut filter: " + cut;
+}
+
+function nightSet(mode) {
+  api({ act: "nightmode", state: mode }).then(function (j) {
+    if (!j || !j.ok) { msg((j && j.err) || "image mode change failed", true); return; }
+    st.night = j;
+    renderNight(j);
+    msg("image mode set to " + mode + " - the ISP switches within a few seconds");
+  });
+}
+$("ndday").onclick = function () { nightSet("day"); };
+$("ndnight").onclick = function () { nightSet("night"); };
+$("ndauto").onclick = function () {
+  nightSet("auto");
+  msg("auto now follows the light sensor, and in a dark room lit by this camera's own IR that sensor says DAY", true);
+};
+
+$("irbtn").onclick = function () {
+  var on = st.night.ir_led === "1";
+  api({ act: "irled", state: on ? "off" : "on" }).then(function (j) {
+    if (!j || !j.ok) { msg((j && j.err) || "illuminator change failed", true); return; }
+    st.night = j;
+    renderNight(j);
+    msg("IR illuminator " + (j.ir_led === "1" ? "on" : "off"));
+  });
+};
+
+$("cutbtn").onclick = function () {
+  var inPos = st.night.ircut === "1";
+  api({ act: "ircut", state: inPos ? 0 : 1 }).then(function (j) {
+    if (!j || !j.ok) { msg((j && j.err) || "filter change failed", true); return; }
+    msg("IR-cut filter moving " + (inPos ? "out" : "in") + " - give it a couple of seconds to travel");
+    /* The motor is slower than the response: refresh after it has arrived, so
+       the label cannot show a position the filter is not in yet. */
+    setTimeout(poll, 3500);
+  });
+};
 
 
 
