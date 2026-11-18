@@ -58,6 +58,7 @@
 #include <string.h>
 #include <stdarg.h>
 #include <unistd.h>
+#include <fcntl.h>
 #include <errno.h>
 #include <signal.h>
 #include <getopt.h>
@@ -75,6 +76,7 @@
 #include "ak_vi.h"
 #include "ak_venc.h"
 #include "ak_drv_ir.h"
+#include "ak_vpss.h"
 #include "vi_abi.h"
 
 #define CH_MAIN 0
@@ -124,6 +126,104 @@ static int g_have_ir;			/* did ak_drv_ir_init() give us the filter? */
 static char g_mode_file[160] = "/tmp/akrtsp.cmd";
 static char g_status_file[160] = "/tmp/akrtsp.status";
 static int g_mode_want = -1;		/* last thing the control file asked for */
+
+/*
+ * What the ISP's own auto-exposure is doing right now, as reported by
+ * ak_vpss_isp_get_ae_run_info(). This turned out to be the only light measurement
+ * on this board that actually responds. The light dependent resistor behind
+ * ak_drv_ir_get_input_level() was A/B tested on the live camera - room light
+ * switched on, then off, reading taken both times - and it reported 1 (DAY) in
+ * both cases with identical thresholds, so nothing sane can be driven from it.
+ * The ISP's auto-exposure loop, on the other hand, sees the picture: the struct
+ * carries the average luminance it is holding, the analogue/digital gains and the
+ * integration time it needed to hold it, and current_darked_flag, which is the
+ * ISP's own day/dark determination.
+ *
+ * The symbol is exported by this board's libplat_vpss.so (152 bytes at 0x1ec0) and
+ * declared in ak_vpss.h, so unlike the AWB/histogram stats it does not have to be
+ * guessed at. The values below are published in the status file before any day/night
+ * rule is built on them - the rule has to come from measurements on this unit.
+ */
+static struct vpss_isp_ae_run_info g_ae;
+static int g_ae_ok;
+
+/*
+ * Auto day/night, driven by what the ISP's auto-exposure loop needs.
+ *
+ * Measured on this unit (room light switched on and off with the camera's own IR
+ * illuminator on, sampled every 4 s, both ISP modes):
+ *
+ *   day mode,   lamp on, room light off : ae_again 12514, ae_lumi 46
+ *   day mode,   lamp on, room light on  : ae_again  4187, ae_lumi 48
+ *   night mode, lamp on, room light off : ae_again 16384 (pegged), ae_lumi 61
+ *   night mode, lamp on, room light on  : ae_again  4669, ae_lumi 56
+ *
+ * The luminance is not the light meter - AE is holding it at roughly its target
+ * (about 50) whatever the room does, which is the whole point of a control loop.
+ * What carries the information is the quantity the loop spends to get there: the
+ * analogue gain, which moves by a factor of about three and pegs at its ceiling in
+ * the dark. So dark and lit are read off the gain, with the integration time as a
+ * secondary confirmation.
+ *
+ * The catch, and the reason for the probe: while the illuminator is lit, the gain
+ * only says how much light reaches the sensor including the camera's own lamp, so
+ * a bright IR-reflective surface a metre away can look like daytime. A switch back
+ * to day is therefore never taken on that reading alone: the lamp goes out for
+ * g_auto_probe_secs, the loop is given g_auto_settle_secs to settle (the AE on this
+ * board takes a few seconds and the filter has travel time), and only the reading
+ * after that decides. That is also why nothing here consults the light dependent
+ * resistor: measured with the room light on and off it reports 1 (DAY) both times,
+ * and acting on it is what produced a day-mode ISP in a dark IR-lit room - the
+ * purple picture.
+ */
+static int g_auto_dark_gain = 9000;		/* at or above this the scene is dark */
+static int g_auto_light_gain = 6500;		/* at or below this it is lit */
+static int g_auto_dark_secs = 15;		/* sustained dark before day -> night */
+static int g_auto_lit_secs = 30;		/* sustained lit before probing back */
+static int g_auto_probe_secs = 16;		/* lamp off for this long; 0 disables */
+static int g_auto_settle_secs = 10;		/* of which ignored while AE settles */
+static int g_auto_dwell_secs = 45;		/* minimum time in one state */
+static int g_auto_rearm_secs = 300;		/* wait after a probe said "still dark" */
+static int g_auto_lamp = 1;			/* auto drives the illuminator */
+static int g_auto_filter = 1;			/* auto drives the IR-cut filter */
+static char g_irled_node[128] = "/sys/user-gpio/IR_LED";
+static char g_ircut_node[128] = "/sys/user-gpio/gpio-ircut_a";
+static char g_ptz_fifo[128] = "/tmp/ptz.daemon";
+
+/* the machine itself */
+static int g_auto_state = -1;			/* -1 unknown, 0 night, 1 day */
+static int g_auto_reason;
+static long g_auto_gain = -1;
+static int g_lamp = -1;				/* last lamp state we wrote/observed */
+static int g_filter_pos = -1;			/* ir-cut position as last observed */
+static int g_dark_cnt, g_lit_cnt, g_dwell_cnt, g_rearm_cnt;
+static int g_probe_left, g_settle_left, g_reason_hold;
+static int g_assert_cnt;
+
+#define AR_NONE 0
+#define AR_INIT 1
+#define AR_DARK 2
+#define AR_PROBE_LIT 3
+#define AR_PROBE_DARK 4
+#define AR_NOAE 5
+#define AR_PROBING 6
+#define AR_SETTLE 7
+#define AR_LIT 8
+
+static const char *auto_reason_name(int r)
+{
+	switch (r) {
+	case AR_INIT: return "first reading";
+	case AR_DARK: return "ae gain held high";
+	case AR_LIT: return "ae gain held low";
+	case AR_PROBE_LIT: return "probe: ambient light";
+	case AR_PROBE_DARK: return "probe: still dark with lamp off";
+	case AR_NOAE: return "no ae data";
+	case AR_PROBING: return "probe running (lamp off)";
+	case AR_SETTLE: return "probe settling";
+	default: return "-";
+	}
+}
 
 static void logmsg(const char *fmt, ...)
 {
@@ -797,7 +897,12 @@ static void write_status(int want, int ldr)
 		return;
 	fprintf(f,
 		"pid=%d\nmode=%s\nwant=%s\nldr=%d\nir_init=%d\nfps=%d,%d\ngop=%d\n"
-		"clients=%d\nframes=%ld,%ld\nkeys=%ld,%ld\nbytes=%ld,%ld\n",
+		"clients=%d\nframes=%ld,%ld\nkeys=%ld,%ld\nbytes=%ld,%ld\n"
+		"ae=%d\nae_lumi=%d\nae_clumi=%d\nae_dark=%d\n"
+		"ae_again=%ld\nae_dgain=%ld\nae_idgain=%ld\nae_exp=%ld\n"
+		"auto=%s\nauto_reason=%s\nauto_gain=%ld\nauto_lamp=%d\n"
+		"auto_probe=%d\nauto_dark_gain=%d\nauto_light_gain=%d\n"
+		"ircut=%d\n",
 		(int)getpid(),
 		g_mode < 0 ? "unset" : (g_mode ? "day" : "night"),
 		want < 0 ? "none" : (want == 2 ? "auto" : (want ? "day" : "night")),
@@ -806,7 +911,32 @@ static void write_status(int want, int ldr)
 		clients,
 		g_prof[CH_MAIN].frames, g_prof[CH_SUB].frames,
 		g_prof[CH_MAIN].keyframes, g_prof[CH_SUB].keyframes,
-		g_prof[CH_MAIN].bytes, g_prof[CH_SUB].bytes);
+		g_prof[CH_MAIN].bytes, g_prof[CH_SUB].bytes,
+		/* The ISP's own view of the light. Published before any rule is built on
+		 * it, so the rule can be argued from numbers in a log rather than from a
+		 * guess: ae_lumi is the average luminance AE is holding, ae_dark is the
+		 * ISP's day/dark flag, and the gains plus the integration time say what it
+		 * had to do to get there. */
+		g_ae_ok,
+		g_ae_ok ? (int)g_ae.current_calc_avg_lumi : -1,
+		g_ae_ok ? (int)g_ae.current_calc_avg_compensation_lumi : -1,
+		g_ae_ok ? (int)g_ae.current_darked_flag : -1,
+		g_ae_ok ? (long)g_ae.current_a_gain : -1,
+		g_ae_ok ? (long)g_ae.current_d_gain : -1,
+		g_ae_ok ? (long)g_ae.current_isp_d_gain : -1,
+		g_ae_ok ? (long)g_ae.current_exp_time : -1,
+		/* What the auto policy is doing and why, so the state can be argued
+		 * from the log instead of from a guess: which state it settled on, the
+		 * reason for the last move, the gain it is reading, the lamp state it
+		 * believes it left, and the thresholds it is using. */
+		g_auto_state < 0 ? "-" : (g_auto_state ? "day" : "night"),
+		auto_reason_name(g_auto_reason),
+		g_auto_gain,
+		g_lamp,
+		g_probe_left,
+		g_auto_dark_gain,
+		g_auto_light_gain,
+		g_filter_pos);
 	fclose(f);
 	rename(path, g_status_file);
 }
@@ -837,6 +967,302 @@ static void apply_mode(int mode, const char *why)
 }
 
 /*
+ * The two effectors the auto policy owns that the ISP call does not: the
+ * illuminator (a sysfs gpio the web CGI writes the same way) and the mechanical
+ * IR-cut filter, which belongs to ptz_daemon and is commanded through its fifo -
+ * the same "/tmp/ptz.daemon" the CGI writes, and the reason this does not go
+ * through ak_drv_ir_set_ircut(): the daemon already owns that gpio and drives it
+ * from the very light sensor that lies on this board, so going around it would
+ * leave two owners fighting.
+ */
+static int node_write(const char *path, const char *text)
+{
+	int fd = open(path, O_WRONLY);
+	size_t len = strlen(text);
+	ssize_t n;
+
+	if (fd < 0)
+		return -1;
+	n = write(fd, text, len);
+	close(fd);
+	return n == (ssize_t)len ? 0 : -1;
+}
+
+static int node_read(const char *path)
+{
+	char c = 0;
+	int fd = open(path, O_RDONLY);
+
+	if (fd < 0)
+		return -1;
+	if (read(fd, &c, 1) != 1) {
+		close(fd);
+		return -1;
+	}
+	close(fd);
+	return c == '1' ? 1 : (c == '0' ? 0 : -1);
+}
+
+static int lamp_get(void)
+{
+	return node_read(g_irled_node);
+}
+
+static void lamp_set(int on, const char *why)
+{
+	if (node_write(g_irled_node, on ? "1" : "0")) {
+		logmsg("day/night: cannot write %s (%s) - illuminator left alone\n",
+		       g_irled_node, strerror(errno));
+		return;
+	}
+	g_lamp = on;
+	logmsg("day/night: ir illuminator -> %s (%s)\n", on ? "on" : "off", why);
+}
+
+/*
+ * One open, one write. The fifo ptz_daemon reads is rebuilt around its own ir
+ * commands, and opening it once per command raced that: measured on the camera, a
+ * version that wrote "irinit" and then opened again for "irsetircut 1" had the
+ * second open fail (the fifo momentarily had no reader) and the filter simply
+ * never moved. One payload, one write, and the reopen is waited for.
+ */
+static int ptz_fifo_send(const char *cmds)
+{
+	size_t len = strlen(cmds);
+	ssize_t n;
+	int fd = -1, tries;
+
+	for (tries = 0; tries < 10; tries++) {
+		fd = open(g_ptz_fifo, O_WRONLY | O_NONBLOCK);
+		if (fd >= 0)
+			break;
+		if (errno != ENXIO && errno != EAGAIN)
+			return -1;
+		usleep(200 * 1000);		/* ptz_daemon rebuilding its fifo */
+	}
+	if (fd < 0)
+		return -1;
+	n = write(fd, cmds, len);
+	close(fd);
+	return n == (ssize_t)len ? 0 : -1;
+}
+
+/*
+ * Move the mechanical IR-cut filter, then read the position back instead of
+ * assuming it: a filter that was commanded and did not move is exactly the failure
+ * that leaves the picture black (filter in, illuminator on), and it belongs in the
+ * log rather than being inferred from a dead frame afterwards.
+ */
+static void filter_set(int in, const char *why)
+{
+	char cmds[64];
+	int tries, now = -1;
+
+	if (!g_auto_filter)
+		return;
+	snprintf(cmds, sizeof cmds, "irinit\nirsetircut %d\n", in ? 1 : 0);
+	if (ptz_fifo_send(cmds)) {
+		logmsg("day/night: %s not accepting commands - the IR-cut filter stays "
+		       "where it is (is ptz_daemon running?)\n", g_ptz_fifo);
+		return;
+	}
+	for (tries = 0; tries < 6; tries++) {		/* mechanical: travel time */
+		sleep(1);
+		now = node_read(g_ircut_node);
+		if (now == in)
+			break;
+	}
+	g_filter_pos = now;
+	logmsg("day/night: ir-cut filter -> %s (%s): %s reads %d%s\n",
+	       in ? "in" : "out", why, g_ircut_node, now,
+	       now == in ? "" : " - IT DID NOT MOVE");
+}
+
+/*
+ * The reason for the last decision stays visible for a minute. The page and the
+ * status file sample every couple of seconds, and a reason the next idle tick
+ * overwrites is a decision nobody can see after the fact - which is what made the
+ * first round of auto logs useless for telling a probe from a threshold hit.
+ */
+static void auto_reason_set(int r)
+{
+	g_auto_reason = r;
+	g_reason_hold = 60;
+}
+
+/*
+ * Put the whole scene into one of the two states: ISP mode, illuminator, filter.
+ * Order matters and is the opposite in the two directions, because the frame must
+ * never be left with the lamp and the filter disagreeing with the ISP: going to
+ * night opens the filter and lights the lamp before the ISP stops doing colour,
+ * going to day kills the lamp and closes the filter before the ISP starts again.
+ */
+static void auto_apply(int state, const char *why)
+{
+	if (state != g_auto_state) {
+		g_dark_cnt = g_lit_cnt = 0;
+		g_dwell_cnt = 0;
+	}
+	g_auto_state = state;
+	if (state == 0) {
+		filter_set(0, why);
+		if (g_auto_lamp && g_lamp != 1)
+			lamp_set(1, why);
+		if (g_mode != 0)
+			apply_mode(0, why);
+	} else {
+		if (g_auto_lamp && g_lamp != 0)
+			lamp_set(0, why);
+		filter_set(1, why);
+		if (g_mode != 1)
+			apply_mode(1, why);
+	}
+}
+
+/*
+ * One second of the auto policy. Called from the day/night thread, which is the
+ * only place that touches the ISP mode, so no locking is needed.
+ */
+static void auto_tick(void)
+{
+	long gain, exp;
+
+	if (!g_ae_ok) {
+		g_auto_reason = AR_NOAE;
+		return;
+	}
+	gain = (long)g_ae.current_a_gain;
+	exp = (long)g_ae.current_exp_time;
+	if (gain <= 0) {
+		g_auto_reason = AR_NOAE;
+		return;
+	}
+	g_auto_gain = gain;
+	if (g_reason_hold > 0)
+		g_reason_hold--;
+
+	if (g_settle_left > 0) {
+		g_settle_left--;
+		g_auto_reason = AR_SETTLE;
+		return;
+	}
+
+	if (g_probe_left > 0) {
+		g_probe_left--;
+		g_auto_reason = AR_PROBING;
+		if (g_probe_left > 0)
+			return;
+		/*
+		 * The lamp has been dark for the settle window, so whatever the loop
+		 * needs now is light that is not coming from this camera.
+		 */
+		if (gain <= g_auto_light_gain) {
+			auto_reason_set(AR_PROBE_LIT);
+			auto_apply(1, auto_reason_name(AR_PROBE_LIT));
+		} else {
+			g_rearm_cnt = g_auto_rearm_secs;
+			auto_reason_set(AR_PROBE_DARK);
+			auto_apply(0, auto_reason_name(AR_PROBE_DARK));
+		}
+		return;
+	}
+
+	if (g_auto_state < 0) {
+		/*
+		 * Anchor on the mode the server would have used anyway (--force-night,
+		 * which for this camera is night), not on the first AE reading. Measured:
+		 * the first reading after a restart reported a low gain in a dark room, the
+		 * policy adopted DAY on it, and the camera sat with the illuminator off and
+		 * the IR-cut filter in - a black picture - for the minute it took the dark
+		 * rule to gather its 15 s plus dwell. The rules below move it as soon as
+		 * the readings mean something; the point of this branch is that the state
+		 * at startup is known-good rather than sampled.
+		 */
+		g_auto_state = g_mode >= 0 ? g_mode
+					  : (g_force_night >= 0 ? g_force_night : 1);
+		auto_reason_set(AR_INIT);
+		logmsg("auto: starting in %s (%s); the ae rules will move it from there\n",
+		       g_auto_state ? "day" : "night", auto_reason_name(AR_INIT));
+		auto_apply(g_auto_state, "startup default");
+		return;
+	}
+
+	g_dwell_cnt++;
+	if (g_rearm_cnt > 0)
+		g_rearm_cnt--;
+
+	/*
+	 * Re-assert the hardware every minute in case it drifted. The filter is
+	 * mechanical and ptz_daemon has its own reasons for moving it; a policy that
+	 * only acts on transitions leaves a camera sitting for hours with the lamp on
+	 * and the filter in - the combination that gives a black picture - because
+	 * nothing decided anything since. Observed while debugging: a filter command
+	 * that was accepted but not carried out left exactly that state behind.
+	 */
+	if (++g_assert_cnt >= 60) {
+		int want_lamp = g_auto_state == 0 ? 1 : 0;
+		int want_filter = g_auto_state == 0 ? 0 : 1;
+
+		g_assert_cnt = 0;
+		if (g_auto_lamp && g_lamp != want_lamp)
+			lamp_set(want_lamp, "auto re-assert");
+		if (g_auto_filter && g_filter_pos != want_filter)
+			filter_set(want_filter, "auto re-assert");
+	}
+
+	if (g_auto_state == 1) {
+		g_lit_cnt = 0;
+		if (gain >= g_auto_dark_gain)
+			g_dark_cnt++;
+		else
+			g_dark_cnt = 0;
+		if (g_dark_cnt >= g_auto_dark_secs && g_dwell_cnt >= g_auto_dwell_secs) {
+			auto_reason_set(AR_DARK);
+			auto_apply(0, auto_reason_name(AR_DARK));
+		} else if (g_reason_hold <= 0) {
+			g_auto_reason = AR_NONE;
+		}
+		/*
+		 * exp is read but not used: on this board the integration time follows
+		 * the ISP mode (2250 us in night, 1350 us in day) and did not move when
+		 * the room light was switched, so it is a mode signature rather than a
+		 * light meter. The gain is what carries the light.
+		 */
+		(void)exp;
+		return;
+	}
+
+	g_dark_cnt = 0;
+	if (gain <= g_auto_light_gain)
+		g_lit_cnt++;
+	else
+		g_lit_cnt = 0;
+	if (g_lit_cnt < g_auto_lit_secs || g_dwell_cnt < g_auto_dwell_secs || g_rearm_cnt > 0) {
+		if (g_reason_hold <= 0)
+			g_auto_reason = AR_NONE;
+		return;
+	}
+	if (g_auto_probe_secs <= 0 || !g_auto_lamp) {
+		/*
+		 * No probe, so the reading is taken at face value. Kept because the
+		 * probe is a visible blink and some installations would rather not have
+		 * one - but the reason then says the switch was made on gain alone,
+		 * with the camera's own lamp still lighting the scene.
+		 */
+		auto_reason_set(AR_LIT);
+		auto_apply(1, auto_reason_name(AR_LIT));
+		return;
+	}
+	g_probe_left = g_auto_probe_secs;
+	g_settle_left = g_auto_settle_secs < g_auto_probe_secs ? g_auto_settle_secs
+							       : g_auto_probe_secs - 1;
+	logmsg("auto: ae gain %ld looks lit, probing ambient with the lamp out for "
+	       "%d s\n", gain, g_auto_probe_secs);
+	lamp_set(0, "ambient probe");
+	g_auto_reason = AR_PROBING;
+}
+
+/*
  * The day/night thread. It now always runs (unless --mode-file "" is given),
  * because its job is no longer only deciding: it applies what the control file
  * asks for and publishes the status the UI reads.
@@ -854,7 +1280,7 @@ static void apply_mode(int mode, const char *why)
 static void *light_watch(void *unused)
 {
 	char word[32];
-	int secs, want, ldr, auto_wanted;
+	int tick = 0, want = -1, ldr = -1;
 
 	(void)unused;
 	g_have_ir = (ak_drv_ir_init() == 0);
@@ -867,24 +1293,57 @@ static void *light_watch(void *unused)
 		want = read_mode_file(g_mode_file, word, sizeof word);
 		g_mode_want = want;
 		ldr = g_have_ir ? ak_drv_ir_get_input_level() : -1;
-		auto_wanted = g_auto_night || want == 2;
+		/* The illuminator is tracked from the node, not from what we last wrote.
+		 * ptz_daemon's irinit re-initialises the IR driver and puts its own idea of
+		 * the lamp on that gpio: measured on this board, a filter command from the
+		 * web page left the lamp OFF while the server still believed it was on, and
+		 * the re-assert below then had nothing to correct. Same for the filter, which
+		 * moves on its own too - one sysfs open each per second is nothing next to
+		 * what the ISP is doing, and a wrong state on the page is worse. */
+		g_lamp = lamp_get();
+		g_filter_pos = node_read(g_ircut_node);
+		if (g_vi)
+			g_ae_ok = (ak_vpss_isp_get_ae_run_info(g_vi, &g_ae) == 0);
 
 		if (want == 0 || want == 1) {
+			/* Manual beats everything, and the auto machine is re-anchored on
+			 * what the operator chose, so coming back to "auto" later does not
+			 * start from a state the operator overrode minutes ago. */
 			if (want != g_mode)
 				apply_mode(want, "control file");
+			if (g_auto_state != want) {
+				g_auto_state = want;
+				g_dwell_cnt = g_dark_cnt = g_lit_cnt = 0;
+				g_probe_left = g_settle_left = 0;
+				g_auto_reason = AR_NONE;
+				g_reason_hold = 0;
+			}
+		} else if (want == 2) {
+			auto_tick();
 		} else if (g_mode < 0 && g_force_night >= 0) {
 			apply_mode(g_force_night, "--force-night");
-		} else if (auto_wanted && ldr >= 0 && ldr != g_mode) {
-			logmsg("day/night: ldr says %d%s\n", ldr,
-			       want == 2 ? " (control file asked for auto)" : "");
+		} else if (g_auto_night && ldr >= 0 && ldr != g_mode) {
+			/*
+			 * Legacy light-sensor path (--auto-night). Left in for boards
+			 * where the resistor is wired to something, but on this unit it
+			 * was measured sitting at 1 with the room light on and off, which
+			 * is exactly the reading that put a day-mode ISP into a dark
+			 * IR-lit room. "auto" in the control file no longer means this.
+			 */
+			logmsg("day/night: ldr says %d (--auto-night; this board's light "
+			       "sensor does not respond)\n", ldr);
 			apply_mode(ldr, "light sensor");
 		}
 
-		write_status(want, ldr);
+		/* Status every 2 s: fresh enough for the page, and the file is rewritten
+		 * whole (temp + rename) so nothing can read it half written. */
+		if (++tick >= 2) {
+			tick = 0;
+			write_status(want, ldr);
+		}
 
-		/* Poll in 1 s slices so a stop is honoured promptly. */
-		for (secs = 0; secs < 5 && g_run; secs++)
-			sleep(1);
+		/* One second slices: the auto policy counts in seconds. */
+		sleep(1);
 	}
 	return NULL;
 }
@@ -1291,6 +1750,24 @@ static void on_stop(int sig)
 	g_run = 0;
 }
 
+/*
+ * The teardown deadline. Reached only when the vendor close never returns; see
+ * the alarm(10) in main's shutdown path.
+ */
+static void on_teardown_timeout(int sig)
+{
+	static const char msg[] =
+		"teardown stalled: the vendor capture/encoder close never returned; "
+		"exiting without it (the kernel releases the capture device, which is "
+		"what a crash does and what the next start already handles)\n";
+
+	(void)sig;
+	/* write(), not fprintf(): a signal handler must stay async-signal-safe, and
+	 * stderr is being taken by the vendor libraries at this very moment. */
+	(void)write(2, msg, sizeof msg - 1);
+	_exit(0);
+}
+
 static void usage(const char *argv0)
 {
 	fprintf(stderr,
@@ -1299,6 +1776,12 @@ static void usage(const char *argv0)
 		"         [--main-kbps 1500] [--sub-kbps 600] [--verbose]\n"
 		"         [--force-night day|night] [--auto-night] [--ir-follow] [--auto-fps]\n"
 		"         [--mode-file /tmp/akrtsp.cmd] [--status-file /tmp/akrtsp.status]\n"
+		"         [--auto-dark-gain 9000] [--auto-light-gain 6500]\n"
+		"         [--auto-dark-secs 15] [--auto-lit-secs 30]\n"
+		"         [--auto-probe-secs 16] [--auto-settle-secs 10]\n"
+		"         [--auto-dwell-secs 45] [--auto-rearm-secs 300]\n"
+		"         [--no-auto-lamp] [--no-auto-filter] [--ir-led-node PATH]\n"
+		"         [--ptz-fifo /tmp/ptz.daemon] [--ircut-node PATH]\n"
 		"\n"
 		"gop is clamped to at least fps: libakstreamenc dies with SIGFPE at the\n"
 		"second keyframe when the GOP is shorter than a second.\n"
@@ -1306,19 +1789,35 @@ static void usage(const char *argv0)
 		"Day/night. Left in day mode under this camera's own IR illuminator the\n"
 		"picture is magenta (mean R-G +76, B-G +79); night mode gives R=G=B across a\n"
 		"full 0..255 range, which is what the vendor's own log calls\n"
-		"\"switching isp mode -> night\". Nothing on this board decides that reliably:\n"
-		"libplat_vi's auto path never switched by itself (90 s measured), the light\n"
-		"sensor reports DAY in a dark IR-lit room, and the ISP's own statistics are\n"
-		"exported by libakispsdk without any header declaring them. So the mode is\n"
-		"asked for, not guessed: the control file (--mode-file) holds one word -\n"
-		"day, night or auto - and wins over --force-night, which is only the default\n"
-		"for when there is no file (this camera: night). --auto-night or \"auto\" in\n"
-		"the file trusts the light sensor, --ir-follow also moves the mechanical\n"
-		"filter (measured to blind the camera when the sensor lies), --auto-fps hands\n"
-		"light adaptation to libplat_vi's thread, which changes the sensor fps that\n"
-		"our fixed-step RTP timestamps do not yet follow.\n"
-		"The status file is rewritten every 5 s for the web UI: current mode, what\n"
-		"was asked for, the light sensor, fps, clients and frame counters.\n", argv0);
+		"\"switching isp mode -> night\". The control file (--mode-file) holds one\n"
+		"word - day, night or auto - and wins over --force-night, which is only the\n"
+		"default for when there is no file (this camera: night).\n"
+		"\n"
+		"\"auto\" reads the ISP's auto-exposure, not the light sensor. The resistor\n"
+		"behind ak_drv_ir_get_input_level() measured 1 (DAY) with the room light on\n"
+		"AND off, and trusting it is what produced the magenta picture. What does\n"
+		"respond is the analogue gain that AE spends to hold its target luminance:\n"
+		"about 4.5k when the room is lit, 12.5k when it is dark in day mode, pegged\n"
+		"at its 16384 ceiling when it is dark in night mode. So dark means gain at or\n"
+		"above --auto-dark-gain for --auto-dark-secs, lit means at or below\n"
+		"--auto-light-gain for --auto-lit-secs. A night -> day switch is never taken\n"
+		"on the camera's own lamp: the lamp goes out for --auto-probe-secs, the loop\n"
+		"is given --auto-settle-secs to settle, and only the reading after that\n"
+		"decides; a probe that says \"still dark\" waits --auto-rearm-secs before the\n"
+		"next one, and a state is held at least --auto-dwell-secs before any change.\n"
+		"auto drives the illuminator (/sys/user-gpio/IR_LED, --ir-led-node, disabled\n"
+		"by --no-auto-lamp) and the IR-cut filter through ptz_daemon's fifo\n"
+		"(/tmp/ptz.daemon, --ptz-fifo, --no-auto-filter); the position is read\n"
+		"back from --ircut-node (/sys/user-gpio/gpio-ircut_a) and published as\n"
+		"ircut= so a command that moved nothing is visible in the log and the\n"
+		"page. --auto-night is the old\n"
+		"light-sensor path, kept for boards where that resistor is wired to\n"
+		"something; --ir-follow also moves the filter on a manual mode change;\n"
+		"--auto-fps hands light adaptation to libplat_vi's thread, which changes the\n"
+		"sensor fps that our fixed-step RTP timestamps do not yet follow.\n"
+		"The status file is rewritten every 2 s for the web UI: current and requested\n"
+		"mode, the ae readings, what auto decided and why, fps, clients and the\n"
+		"frame counters.\n", argv0);
 }
 
 static int parse_size(const char *s, int *w, int *h)
@@ -1341,6 +1840,13 @@ int main(int argc, char **argv)
 		{ "main-kbps", 1, 0, 'b' }, { "sub-kbps", 1, 0, 'k' },
 		{ "no-night", 0, 0, 'N' }, { "force-night", 1, 0, 'n' },
 		{ "auto-night", 0, 0, 'A' }, { "ir-follow", 0, 0, 'f' },
+		{ "auto-dark-gain", 1, 0, 'D' }, { "auto-light-gain", 1, 0, 'L' },
+		{ "auto-dark-secs", 1, 0, 'd' }, { "auto-lit-secs", 1, 0, 'l' },
+		{ "auto-probe-secs", 1, 0, 'P' }, { "auto-settle-secs", 1, 0, 'e' },
+		{ "auto-dwell-secs", 1, 0, 'w' }, { "auto-rearm-secs", 1, 0, 'R' },
+		{ "no-auto-lamp", 0, 0, 'x' }, { "no-auto-filter", 0, 0, 'y' },
+		{ "ir-led-node", 1, 0, 'I' }, { "ptz-fifo", 1, 0, 'u' },
+		{ "ircut-node", 1, 0, 'C' },
 		{ "auto-fps", 0, 0, 'a' },
 		{ "mode-file", 1, 0, 'm' }, { "status-file", 1, 0, 's' },
 		{ "verbose", 0, 0, 'v' }, { "help", 0, 0, 'h' }, { 0, 0, 0, 0 }
@@ -1353,7 +1859,9 @@ int main(int argc, char **argv)
 	g_prof[CH_SUB].w = 640;
 	g_prof[CH_SUB].h = 480;
 
-	while ((c = getopt_long(argc, argv, "p:F:G:M:S:b:k:n:aNAfm:s:vh", longopts, NULL)) != -1) {
+	while ((c = getopt_long(argc, argv,
+			"p:F:G:M:S:b:k:n:aNAfm:s:D:L:d:l:P:e:w:R:x:y:I:u:C:vh",
+			longopts, NULL)) != -1) {
 		switch (c) {
 		case 'p': port = atoi(optarg); break;
 		case 'F': fps = atoi(optarg); break;
@@ -1366,6 +1874,25 @@ int main(int argc, char **argv)
 		case 'A': g_auto_night = 1; break;
 		case 'f': g_ir_follow = 1; break;
 		case 'a': g_auto_fps = 1; break;
+		case 'D': g_auto_dark_gain = atoi(optarg); break;
+		case 'L': g_auto_light_gain = atoi(optarg); break;
+		case 'd': g_auto_dark_secs = atoi(optarg); break;
+		case 'l': g_auto_lit_secs = atoi(optarg); break;
+		case 'P': g_auto_probe_secs = atoi(optarg); break;
+		case 'e': g_auto_settle_secs = atoi(optarg); break;
+		case 'w': g_auto_dwell_secs = atoi(optarg); break;
+		case 'R': g_auto_rearm_secs = atoi(optarg); break;
+		case 'x': g_auto_lamp = 0; break;
+		case 'y': g_auto_filter = 0; break;
+		case 'I':
+			snprintf(g_irled_node, sizeof g_irled_node, "%s", optarg);
+			break;
+		case 'u':
+			snprintf(g_ptz_fifo, sizeof g_ptz_fifo, "%s", optarg);
+			break;
+		case 'C':
+			snprintf(g_ircut_node, sizeof g_ircut_node, "%s", optarg);
+			break;
 		case 'm':
 			snprintf(g_mode_file, sizeof g_mode_file, "%s", optarg);
 			break;
@@ -1397,6 +1924,27 @@ int main(int argc, char **argv)
 	}
 	g_prof[CH_MAIN].kbps = main_kbps;
 	g_prof[CH_SUB].kbps = sub_kbps;
+
+	/*
+	 * The auto band has to be a band: if "lit" starts at or above where "dark"
+	 * starts, the policy sits on the same number twice and oscillates the lamp,
+	 * the filter and the ISP a few times a minute. That is worth refusing rather
+	 * than shipping, because the symptom is a camera that strobes its own
+	 * illuminator.
+	 */
+	if (g_auto_light_gain >= g_auto_dark_gain)
+		die("auto: --auto-light-gain (%d) must be below --auto-dark-gain (%d)\n",
+		    g_auto_light_gain, g_auto_dark_gain);
+	if (g_auto_probe_secs > 0 && g_auto_settle_secs >= g_auto_probe_secs)
+		die("auto: --auto-settle-secs (%d) must be shorter than "
+		    "--auto-probe-secs (%d): the reading taken after settling is the "
+		    "one that decides\n", g_auto_settle_secs, g_auto_probe_secs);
+	if (g_auto_dark_secs < 1)
+		g_auto_dark_secs = 1;
+	if (g_auto_lit_secs < 1)
+		g_auto_lit_secs = 1;
+	if (g_auto_dwell_secs < 1)
+		g_auto_dwell_secs = 1;
 
 	setvbuf(stdout, NULL, _IONBF, 0);
 	srand((unsigned)time(NULL) ^ (unsigned)getpid());
@@ -1491,6 +2039,19 @@ int main(int argc, char **argv)
 
 	printf("stopping\n");
 	g_run = 0;
+	/*
+	 * Bounded teardown. ak_vi_close() waits on a thread the vendor library starts
+	 * for its own light adaptation (vi_change_fps), and that thread does not always
+	 * come back: measured after a day/night switch, the process then sat in
+	 * futex_wait with the encoder already gone and :554 still held, so the
+	 * supervisor believed akrtsp was healthy and never restarted it - the camera
+	 * streamed nothing until someone noticed and killed it by hand. The cleanup
+	 * therefore runs against a 10 s deadline; past it the process exits by itself
+	 * and the kernel releases the capture device, which is what a crash does and
+	 * what the next start already copes with.
+	 */
+	signal(SIGALRM, on_teardown_timeout);
+	alarm(10);
 	for (ch = 0; ch < N_CH; ch++)
 		if (g_prof[ch].stream)
 			ak_venc_cancel_stream(g_prof[ch].stream);
@@ -1512,5 +2073,6 @@ int main(int argc, char **argv)
 		ak_vi_close(g_prof[CH_MAIN].vi);
 	}
 	close(listen_fd);
+	alarm(0);					/* teardown finished inside the deadline */
 	return 0;
 }

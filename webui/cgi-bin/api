@@ -115,6 +115,17 @@ ptz_send() {
   printf '%s\n' "$1" > "$FIFO"
 }
 
+# ptz_ircut <0|1> -- move the IR-cut filter with ONE write. Two separate writes
+# race ptz_daemon rebuilding the fifo around its own ir commands: measured on the
+# camera, "irinit" landed and "irsetircut 1" vanished into a fifo that had no
+# reader at that instant, so the filter never moved while the caller reported
+# success. One payload with both lines is what the daemon expects.
+ptz_ircut() {
+  case "$1" in 0|1) : ;; *) return 1 ;; esac
+  [ -p "$FIFO" ] || return 1
+  printf 'irinit\nirsetircut %s\n' "$1" > "$FIFO"
+}
+
 # get_pos -> sets P_PAN P_TILT from the daemon's own position file.
 P_PAN=0; P_TILT=0
 get_pos() {
@@ -173,12 +184,21 @@ st_val() {
 light_json() {
   want=$(head -c 8 "$DNF" 2>/dev/null)
   case "$want" in day|night|auto) : ;; *) want=unset ;; esac
-  mode=unset; ldr=-1; clients=0; apid=; fps=?
+  mode=unset; ldr=-1; clients=0; apid=; fps=?; ael=-1; aed=-1; aea=-1; aeexp=-1
+  ast=-; ars=-; agn=-1; icst=-1
   if [ -r "$AKST" ]; then
-    set -- $(awk -F= 'BEGIN{m="unset";l=-1;c=0;p="";f="?"} \
+    set -- $(awk -F= 'BEGIN{m="unset";l=-1;c=0;p="";f="?";al=-1;ad=-1;aa=-1;ax=-1; \
+              s="-";r="-";g=-1;ic=-1} \
         $1=="mode"{m=$2} $1=="ldr"{l=$2} $1=="clients"{c=$2} $1=="pid"{p=$2} \
-        $1=="fps"{f=$2} END{print m,l,c,p,f}' "$AKST" 2>/dev/null)
+        $1=="fps"{f=$2} $1=="ae_lumi"{al=$2} $1=="ae_dark"{ad=$2} \
+        $1=="ae_again"{aa=$2} $1=="ae_exp"{ax=$2} \
+        $1=="auto"{s=$2} \
+        $1=="auto_reason"{gsub(/ /,"_",$2); r=$2} $1=="auto_gain"{g=$2} \
+        $1=="ircut"{ic=$2} \
+        END{print m,l,c,p,f,al,ad,aa,ax,s,r,g,ic}' "$AKST" 2>/dev/null)
     mode=${1:-unset}; ldr=${2:--1}; clients=${3:-0}; apid=${4:-}; fps=${5:-?}
+    ael=${6:--1}; aed=${7:--1}; aea=${8:--1}; aeexp=${9:--1}
+    ast=${10:--}; ars=${11:--}; agn=${12:--1}; icst=${13:--1}
   fi
   run=0
   if [ -n "$apid" ] && [ -r "/proc/$apid/comm" ]; then
@@ -186,9 +206,22 @@ light_json() {
     [ "$c" = akrtsp ] && run=1
   fi
   if [ "$run" = 0 ] && ak_pid >/dev/null; then run=1; fi
-  printf '"night_set":"%s","night_mode":"%s","ldr":%s,"ir_led":"%s","ircut":"%s","akrtsp":%s,"ak_pid":"%s","ak_fps":"%s","ak_clients":%s' \
-    "$want" "$mode" "$ldr" \
-    "$(node_val "$IRLED")" "$(node_val "$IRCUTN")" \
+
+  # The IR-cut position: prefer what the stream server read back (it checks the
+  # node after commanding and re-asserts it every minute), falling back to a direct
+  # read when akrtsp is not running or predates the ircut= field. One sysfs read
+  # fewer per poll, and it agrees with what the server thinks it did.
+  cut=$(node_val "$IRCUTN")
+  [ "$run" = 1 ] && [ "$icst" != -1 ] && cut=$icst
+  # ae_lumi / ae_again are the ISP's own reading of the scene and the only light
+  # signal on this board that responds; ldr is the hardware light sensor, which is
+  # reported as measured (it sits at 1 whatever the room does) so the page cannot
+  # be mistaken for a working light meter. auto_* say what the policy in akrtsp
+  # settled on, why, and what gain it is looking at.
+  printf '"night_set":"%s","night_mode":"%s","ldr":%s,"ae_lumi":%s,"ae_dark":%s,"ae_again":%s,"ae_exp":%s,"auto_state":"%s","auto_reason":"%s","auto_gain":%s,"ir_led":"%s","ircut":"%s","akrtsp":%s,"ak_pid":"%s","ak_fps":"%s","ak_clients":%s' \
+    "$want" "$mode" "$ldr" "$ael" "$aed" "$aea" "$aeexp" \
+    "$ast" "$ars" "$agn" \
+    "$(node_val "$IRLED")" "$cut" \
     "$run" "${apid:-?}" "$fps" "$clients"
 }
 
@@ -509,11 +542,25 @@ case "$act" in
     # so the page can show where the filter actually is rather than what was last
     # asked for. Measured on this camera: filter in mean 44, filter out mean 136.
     case "$state" in
-      1) ptz_send "irinit"; ptz_send "irsetircut 1" ;;
-      0) ptz_send "irinit"; ptz_send "irsetircut 0" ;;
+      0|1) : ;;
       *) echo '{"ok":0,"err":"bad state"}'; exit 0 ;;
     esac
-    echo "{\"ok\":1,\"ircut\":\"$(node_val "$IRCUTN")\"}"
+    if ! ptz_ircut "$state"; then
+      echo '{"ok":0,"err":"ptz_daemon is not accepting commands"}'; exit 0
+    fi
+    # It is a motor, so the position read straight after the write is still the
+    # old one: wait for it to arrive and report whether it did, because "commanded"
+    # and "moved" are different claims - and a filter stuck IN while the
+    # illuminator is ON is a black picture, not a dim one.
+    v=$(node_val "$IRCUTN"); i=0
+    while [ "$v" != "$state" ] && [ "$i" -lt 6 ]; do
+      sleep 0.5
+      v=$(node_val "$IRCUTN")
+      i=$((i + 1))
+    done
+    moved=0
+    [ "$v" = "$state" ] && moved=1
+    echo "{\"ok\":1,\"ircut\":\"$v\",\"moved\":$moved}"
     ;;
 
   nightmode)

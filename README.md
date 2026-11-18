@@ -1,8 +1,12 @@
 # Anyka AK3918 camera — research, replacement web UI, and what to do next
 
 Camera: `192.168.10.46` · Anyka AK3918 · GC1084 sensor · Linux 3.4.35 armv5tejl ·
-36 MB RAM (~12 MB free) · 14.6 GB microSD at `/mnt` · Wi-Fi 2.4 GHz (SSID
-`www.si-wifi.org-DARKMAN_AN`), MAC `84:B4:D2:74:92:F6`.
+36 MB RAM (~12 MB free) · 14.6 GB microSD at `/mnt` · Wi-Fi 2.4 GHz. The network
+name (SSID) and the MAC of this particular camera are deliberately **not** recorded
+in this file — they identify your home, not the board. Read them on the camera when
+you need them: `ifconfig wlan0`, `cat /etc/jffs2/wpa_supplicant.conf`. The same
+rule applies to any password: nothing here stores one except the vendor's stock
+factory pair, which is in `INSTALL.md` because it is what the SD-card hack needs.
 
 **Want to install this on your own camera? Start at `INSTALL.md`** — it is the
 complete path from an untouched SD-card hack to a working preview, including which

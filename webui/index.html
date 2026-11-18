@@ -87,11 +87,17 @@ hr{border:0;border-top:1px solid var(--line);margin:14px 0}
   <span class="chip"><span class="dot" id="live"></span><span id="ip">connecting&hellip;</span></span>
   <span class="chip">PAN <b id="cpos">--</b></span>
   <span class="chip">TILT <b id="cpos2">--</b></span>
+  <!-- The light level as the ISP sees it. This board's own light sensor is dead
+       (it reads "day" with the room light on and off - see README), so the number
+       here is ae_lumi: the scene luminance the auto-exposure loop is holding,
+       0..255, with the ISP's own day/dark flag and the IR lamp state next to it.
+       It is the only light number on this camera that actually moves. -->
+  <span class="chip" id="lightchip" title="scene luminance held by the ISP's auto-exposure (0..255), ISP day/dark flag, IR lamp state">LIGHT <b id="lightval">--</b></span>
   <span class="chip" id="uptime">up --</span>
   <span class="chip" id="load">load --</span>
-  <!-- If this does not read "ui v22", the browser is running a cached page and
+  <!-- If this does not read "ui v23", the browser is running a cached page and
        none of the fixes below are the ones you are clicking. -->
-  <span class="chip" id="uiver">ui v22</span>
+  <span class="chip" id="uiver">ui v23</span>
 
 
 </header>
@@ -195,8 +201,12 @@ hr{border:0;border-top:1px solid var(--line);margin:14px 0}
         <div class="hint">Night is the mode that measures neutral under this camera's own infrared light
           (R=G=B across 0..255); the same scene through a day-mode ISP measures R-G +76, B-G +79 &mdash; that is
           the purple picture. The change is applied while the stream keeps running, and it is remembered across
-          restarts. Auto trusts the light sensor, and this sensor reports DAY in a dark IR-lit room because the
-          illuminator lights it, so auto is a choice here, not the default.</div>
+          restarts. Auto does <em>not</em> read the light sensor (measured: it reports DAY with the room light on
+          and with it off). It reads the analogue gain the ISP's auto-exposure loop spends to hold its luminance
+          target &mdash; about 4.5k when the room is lit, 12.5k in day mode and pegged at 16384 in night mode when
+          it is dark. Day means lamp out and IR-cut filter in; night means lamp on and filter out. Before a night
+          to day switch it puts the illuminator out for about 16 s and re-reads, so the decision is not made on the
+          camera's own light; the picture goes dark for those seconds while it checks.</div>
         <div class="row">
           <button class="btn sm" id="irbtn">IR illuminator</button>
           <button class="btn sm" id="cutbtn">IR-cut filter</button>

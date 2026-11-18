@@ -48,7 +48,7 @@ fi
 LOG=${LOG:-/tmp/akrtsp.log}
 SUP=${SUP:-/tmp/akrtsp_sup.log}
 PIDF=${PIDF:-/tmp/akrtsp_sup.pid}
-AK_ARGS=${AK_ARGS:---mode-file /mnt/camweb/daynight.conf --force-night night}
+AK_ARGS=${AK_ARGS:---mode-file /mnt/camweb/daynight.conf --force-night night --ir-follow}
 
 pids_by_comm()
 {
@@ -67,6 +67,7 @@ say()
 }
 
 fails=0
+idle_rounds=0
 
 # Single instance. Two supervisors would both notice an empty :554 and start two
 # akrtsp at each other, which on this board means the second one dies on
@@ -84,11 +85,32 @@ echo $$ > "$PIDF"
 say "supervisor up: interval=${INTERVAL}s maxfails=${MAXFAILS} args='$AK_ARGS' bin=$(md5sum $BIN 2>/dev/null | cut -c1-8)"
 
 while :; do
-	if [ -n "$(pids_by_comm akrtsp)" ]; then
+	AP=$(pids_by_comm akrtsp)
+	if [ -n "$AP" ]; then
 		fails=0
+		# Alive is not the same as serving. A process that is stuck in teardown, or
+		# wedged with its listening socket gone, looks perfectly healthy to `ps' and
+		# is invisible to the NVR until someone notices a recording gap - and this
+		# supervisor used to take the process list at its word. Three rounds of
+		# "process up, nothing on :554" and it kills it, which drops the loop into the
+		# "nothing owns :554" path below. Three rounds, not one, so a start that is
+		# still bringing its socket up is never killed mid-bind.
+		if netstat -tln 2>/dev/null | grep -q ':554'; then
+			idle_rounds=0
+		else
+			idle_rounds=$((idle_rounds + 1))
+			if [ "$idle_rounds" -ge 3 ]; then
+				say "akrtsp (pid $AP) is alive but nothing is on :554; killing it"
+				idle_rounds=0
+				for p in $AP; do kill -9 "$p" 2>/dev/null; done
+				sleep 2
+				continue
+			fi
+		fi
 		sleep "$INTERVAL"
 		continue
 	fi
+	idle_rounds=0
 
 	if [ -n "$(pids_by_comm rtsp)" ]; then
 		say "vendor rtsp owns the stream, standing down"

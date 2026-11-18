@@ -22,8 +22,12 @@ tools/.token
 # akrtsp.stripped is a real deployment hazard here (see README, "Deploying the
 # wrong binary")
 src/akstream
+src/akstream.stripped
 src/akrtsp
 src/akrtsp.stripped
+src/akvi_probe
+src/akir_probe
+src/akir_probe.stripped
 src/irprobe
 src/*.o
 *.elf

@@ -1000,10 +1000,46 @@ document.addEventListener("visibilitychange", function () {
  * If they differ, the change is in flight (akrtsp polls every 5 s) - or the
  * stream server is not running, which the line says out loud.
  */
+/*
+ * Light bar for the header chip, built from the gain the ISP's auto-exposure loop
+ * is spending. Gain, not luminance, is what carries the light information on this
+ * board: AE holds its luminance target (about 50) whatever the room does, and what
+ * changes is the price it pays to get there - measured about 4.5k with the room
+ * light on, 12.5k in day mode and pegged at its 16384 ceiling in night mode with
+ * the room dark. Log scale, because the useful range is a factor of four and the
+ * peg at the top is a cliff.
+ */
+function lightbar(gain) {
+  var g = Math.max(1, gain || 1);
+  var darkish = (Math.log(g) - Math.log(2000)) / (Math.log(16384) - Math.log(2000));
+  var n = Math.round((1 - darkish) * 10);
+  var s = "", i;
+  if (n < 0) n = 0;
+  if (n > 10) n = 10;
+  for (i = 0; i < 10; i++) s += (i < n ? "#" : ".");
+  return s;
+}
+
+function kfmt(v) {
+  return v >= 1000 ? (v / 1000).toFixed(1) + "k" : String(v);
+}
+
 function renderNight(j) {
-  var b;
-  if (!$("ndinfo")) return;                 // page without this panel
+  var b, gain = -1, lumi = -1;
   st.night = j;
+
+  /*
+   * The header light chip. The hardware light sensor behind j.ldr was measured
+   * reading 1 (day) with the room light switched on and off, so it cannot be shown
+   * as "the light"; the gain the ISP is spending can, and it is the same number the
+   * auto policy in akrtsp decides on.
+   */
+  if (typeof j.ae_again === "number" && j.ae_again > 0) gain = j.ae_again;
+  if (typeof j.ae_lumi === "number" && j.ae_lumi >= 0) lumi = j.ae_lumi;
+  b = $("lightval");
+  if (b) b.textContent = (gain < 0 ? "n/a" : kfmt(gain) + " " + lightbar(gain));
+
+  if (!$("ndinfo")) return;                 // page without this panel
 
   var set = j.night_set || "unset";
   Array.prototype.forEach.call([["ndday", "day"], ["ndnight", "night"], ["ndauto", "auto"]],
@@ -1015,9 +1051,21 @@ function renderNight(j) {
   var note = "";
   if (!j.akrtsp) note = " - stream server not running";
   else if (set !== "unset" && set !== "auto" && set !== j.night_mode) note = " - applying";
+  var auto = "";
+  if (set === "auto") {
+    auto = "  |  auto: " + (j.auto_state || "-");
+    if (j.auto_reason && j.auto_reason !== "-")
+      auto += " (" + String(j.auto_reason).replace(/_/g, " ") + ")";
+    if (j.auto_gain > 0) auto += " @ gain " + j.auto_gain;
+  }
   $("ndinfo").textContent = "asked: " + set + "  |  ISP now: "
-    + (j.night_mode || "unset") + "  |  light sensor: " + ldr
+    + (j.night_mode || "unset") + auto
+    + "  |  ae gain " + (j.ae_again === undefined ? "?" : j.ae_again)
+    + "  |  scene " + (lumi < 0 ? "n/a" : lumi + "/255")
+    + "  |  exp " + (j.ae_exp === undefined ? "?" : j.ae_exp)
     + "  |  IR led: " + led + "  |  filter: " + cut + note;
+  $("ndinfo").title = "the board's own light sensor reports " + ldr
+    + "; it does not respond on this unit and is not used for anything";
 
   b = $("irbtn"); if (b) b.textContent = "IR illuminator: " + led;
   b = $("cutbtn"); if (b) b.textContent = "IR-cut filter: " + cut;
@@ -1035,7 +1083,13 @@ $("ndday").onclick = function () { nightSet("day"); };
 $("ndnight").onclick = function () { nightSet("night"); };
 $("ndauto").onclick = function () {
   nightSet("auto");
-  msg("auto now follows the light sensor, and in a dark room lit by this camera's own IR that sensor says DAY", true);
+  /* Say what auto actually looks at, because the obvious guess is wrong on this
+     board: the light sensor reads DAY whether the room light is on or off, and
+     trusting it is what produced the magenta picture. auto follows the ISP's
+     auto-exposure gain instead, and the visible sign of that is the illuminator
+     going out for a few seconds while the camera checks for ambient light. */
+  msg("auto now follows the ISP auto-exposure gain (this board's light sensor does not respond); " +
+      "the IR illuminator blinks off briefly while it probes for ambient light");
 };
 
 $("irbtn").onclick = function () {
@@ -1052,7 +1106,15 @@ $("cutbtn").onclick = function () {
   var inPos = st.night.ircut === "1";
   api({ act: "ircut", state: inPos ? 0 : 1 }).then(function (j) {
     if (!j || !j.ok) { msg((j && j.err) || "filter change failed", true); return; }
-    msg("IR-cut filter moving " + (inPos ? "out" : "in") + " - give it a couple of seconds to travel");
+    /* The CGI waits for the motor and reports whether the node actually reached
+       the position, so "moving" is not guessed here. A filter that was commanded
+       and did not travel is a black picture when the illuminator is on, and the
+       page must say so instead of showing the position that was asked for. */
+    if (j.moved === 0)
+      msg("IR-cut filter did NOT reach " + (inPos ? "out" : "in") +
+          " - the command was accepted and the motor did not move", true);
+    else
+      msg("IR-cut filter " + (inPos ? "out" : "in"));
     /* The motor is slower than the response: refresh after it has arrived, so
        the label cannot show a position the filter is not in yet. */
     setTimeout(poll, 3500);
