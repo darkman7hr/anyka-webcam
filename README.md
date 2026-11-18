@@ -124,8 +124,10 @@ Features: 8-way pad with press-and-hold repeat · step sizes 2/5/10/30° ·
 **12 named recorded positions** (Go / Save / Clear, stored on the camera so they
 survive reboot and are shared between browsers) · patrol mode that cycles the
 saved positions · **drag anywhere on the image to aim** · absolute pan/tilt
-entry · live position in the header · white LED · reboot · RTSP URLs click to
-copy.
+entry · live position in the header · white LED · **image mode day / night / auto
+and the IR illuminator and IR-cut filter as separate switches, each showing what
+the camera reports rather than what was clicked** (see "Day/night from the
+browser") · reboot · RTSP URLs click to copy.
 
 Naming a position opens a text field **inside its own card**, delete asks twice
 (the `×` turns into "Sure?"), and the token is typed into a panel rather than a
@@ -847,16 +849,12 @@ fragmented MP4 to a viewer (221 KB in 12 s, 253 fragments ≈ 21 fps out), keeps
 where it was — one relay process gone, ports 1984/8554 closed, overcommit back
 to 0, our server's `oom_score_adj` back to 0, 25.2 MB available. **22/22 checks.**
 
-Two things this does **not** change, on purpose:
-
-* **A reboot returns the stock server.** `/tmp` is tmpfs, so `/tmp/akrtsp` is gone
-  after a reboot, and `config.sh` still starts `/mnt/Factory/custom/rtsp`. Making
-  this permanent means editing `config.sh` and putting the binary somewhere that
-  survives — deliberately not done yet, so the undo is a reboot.
-* **Nothing supervises either server.** The vendor binary was never restarted
-  when it died either, so this is no worse, but a crash now means no stream for
-  anyone until something is started by hand. `--restore` is the one-command
-  rollback while the box is up.
+Two questions that were open when this was first measured have since been closed,
+each in its own section below: nothing supervised either server, and a reboot put
+the stock binary back. Both are dealt with now — see "Supervision" and
+"Persistent: the card, not `/tmp`". The rollback is still one command while the box
+is up (`run_takeover.sh --restore`), and still a one-line comment in `config.sh` if
+the vendor binary is wanted back for good.
 
 **A grep that matched its own script.** The helper greps in these scripts went
 through two wrong versions of the same idea. `grep 'custom/rtsp'` misses a
@@ -923,11 +921,23 @@ each measured rather than assumed:
   using them means guessing struct layouts on a board that cannot be debugged
   interactively. Not done.
 
-The vendor's own choice therefore lives above the SDK — `libapp_rtsp.so` imports
-**no** ISP, VI or IR function at all (its import list is audio, `ak_venc_*`,
-threads), so its day/night decision comes from its settings stack, not from a
-library default. For this deployment the flag is explicit:
-`--force-night night`, which is what the camera is running now.
+Checking the vendor executable itself (`readelf -sW logs/vendor/rtsp`) completes the
+picture and corrects a guess made earlier in this file from library imports alone:
+`libapp_rtsp.so` really does import no ISP/VI/IR function, but the **`rtsp`
+executable** imports `ak_vi_switch_mode` (undefined, referenced twice) and carries
+its own 456-byte function called `ak_misc_set_video_day_night` — a symbol no
+library on this card exports and no header in the dump declares, because it is the
+vendor's own code compiled in. Its strings also name `/sys/user-gpio/IR_LED` and
+`/sys/user-gpio/gpio-ircut_a`: the vendor drives the illuminator and the mechanical
+filter straight through sysfs, not through `ak_drv_ir`. So the mechanism is ours
+after all — switch the ISP mode — plus two gpios, and both nodes turned out to be
+world-writable and to answer (see "Day/night from the browser").
+
+What mode is *asked for* is a file now, not a flag. The launcher and the supervisor
+pass `--mode-file /mnt/camweb/daynight.conf`; `--force-night night` is only the
+fallback for when that file says nothing usable. The web UI writes the file, so the
+mode outlives a restart of the server and a reboot of the camera, and can be changed
+while the stream is running.
 
 What night mode costs, measured rather than assumed: an IR-lit scene is noisy and
 VBR spends for it — main runs at **999 kbps** against the ~500 kbps of the day-mode
@@ -956,17 +966,19 @@ that matters on a board with **one** capture pipeline:
 
 It also keeps one instance (pidfile), rotates its own log at 400 kB because `/tmp`
 is tmpfs on a 32 MB box that has been OOM-killed before, and defaults to the same
-`AK_ARGS="--force-night night"` as the launcher so a restarted process gets night
-mode without anyone remembering.
+`AK_ARGS="--mode-file /mnt/camweb/daynight.conf --force-night night"` as the
+launcher, so a restarted process gets night mode without anyone remembering — and
+picks up whatever mode the UI had set, from the file.
 
 Tested by killing it, not by reading the script: `kill -9` on the running server
 left :554 empty, and the supervisor logged `nothing on :554; starting akrtsp
 (attempt 1/3)` then `akrtsp up on :554 (pid 21693)` — bound inside one 8 s round.
 The NVR reconnected by itself (new ports 48775/48776, Send-Q 0), night mode came
 back (`isp -> night (--force-night)`, then R=G=B), and the restarted server measured
-20.09 fps, 0 seq gaps, 1.00 media s per wall s. It is still only in `/tmp`: it
-disappears on reboot like the binary does, so boot persistence and supervision are
-the same decision (see section 6).
+20.09 fps, 0 seq gaps, 1.00 media s per wall s. That was a hand-started `/tmp` run;
+the same loop now starts by itself at boot from the card (next section), and a
+`kill -9` after the boot was recovered the same way — new pid, `/proc/<pid>/exe`
+still `/mnt/camrtsp/akrtsp`, night mode re-applied from the control file.
 
 The give-up-and-fall-back path was tested too, with `src/fake_akrtsp.sh` (a binary
 that always exits 1) under isolated paths so it could not touch the live instance:
@@ -980,7 +992,123 @@ happened. Success now requires the process it launched to be alive by `comm` **a
 the port to be up. `NOFALLBACK=1` exists for exactly this kind of test: it stops the
 supervisor from starting the vendor binary while a real server is still streaming.
 
+### Persistent: the card, not `/tmp`
+
+Everything above ran out of `/tmp`, which is tmpfs: a reboot put
+`/mnt/Factory/custom/rtsp` back and took our server and its supervisor away with
+it. That is no longer true, and the change is three files on the card plus one line
+in the boot script.
+
+```
+/mnt/camrtsp/akrtsp            the stripped build (md5 checked after every upload)
+/mnt/camrtsp/run_akrtsp.sh     the supervisor; BIN defaults to this path if the
+                               binary is here, else /tmp/akrtsp
+/mnt/camrtsp/run_takeover.sh   handover + --restore, so rollback survives a reboot
+/mnt/camweb/daynight.conf      the wanted ISP mode: one word, night here
+```
+
+and in `/mnt/Factory/config.sh`, at the point where the vendor server used to start
+(after `sleep 30`, so the ordering versus `net_manage.sh` and `ptz_daemon` is the
+one the vendor had):
+
+```sh
+BIN=/mnt/camrtsp/akrtsp AK_ARGS="--mode-file /mnt/camweb/daynight.conf --force-night night" \
+  /bin/sh /mnt/camrtsp/run_akrtsp.sh 10 3 >/tmp/akrtsp_boot.log 2>&1 &
+# /mnt/Factory/custom/rtsp &
+```
+
+The vendor line is **commented, not deleted**, and the vendor binary itself is
+untouched, so the rollback is a one-character uncomment (or
+`sh /mnt/camrtsp/run_takeover.sh --restore` while the box is up — the supervisor
+sees the vendor server on :554 and stands down by itself, which is the same rule it
+follows when a person chose it by hand). `/mnt/camweb/backup/` holds
+`config.sh.orig` (pristine factory) and `config.sh.vendor-rtsp` (the state just
+before this change). `config.sh` is uploaded as `config.sh.new`, parsed with
+`sh -n` on the camera, and only moved into place if it parses — the same discipline
+`deploy.py` uses for the web line.
+
+Verified by rebooting the camera, not by reasoning about the script. From the boot
+log and `/proc`: supervisor up at uptime 38 s, `akrtsp up on :554 (pid 1683)` at
+58 s, `/proc/1683/exe -> /mnt/camrtsp/akrtsp`, command line carrying
+`--mode-file /mnt/camweb/daynight.conf`, status file `mode=night want=night`, no
+process with comm `rtsp` anywhere, NVR reconnected on its own, and the stream
+measured 20.20 fps, GOP 1.00 s, 0 seq gaps, 1.00 media s per wall s.
+
+### Day/night from the browser: three controls, three mechanisms
+
+"Switch the IR off" and "switch to day" sound like one request and are three
+different pieces of hardware. The UI and the API name them separately, because
+collapsing them is how you end up with a button that appears to work and a black
+picture:
+
+| control | what it is | how it is reached | measured effect on this camera |
+|---|---|---|---|
+| **Image mode: day / night / auto** | the ISP's colour/IR handling | one word into `--mode-file`, read by the server's light thread every 5 s, applied with `ak_vi_switch_mode` — **no restart, the stream keeps running** | night `R=G=B`, 100 % neutral; day `R−G +55.7, B−G +36.5`, 5 % neutral (the purple picture) |
+| **IR illuminator** | the IR LEDs, a gpio | `echo 0\|1 > /sys/user-gpio/IR_LED` (world-writable) | mean luminance 142 → 127 and **75 % of the pixels of a static frame moved** (mean \|diff\| 27.5) — automatic gain takes back some of the brightness, so the mean alone understates it |
+| **IR-cut filter** | the mechanical filter in front of the sensor | `act=ircut`, through `ptz_daemon`, which drives the motor | filter in mean **44**, filter out **136**; takes a couple of seconds to travel, so the reply reports the position the filter is *in*, not the one that was asked for |
+
+The server publishes the truth in `--status-file` (`/tmp/akrtsp.status`): its pid,
+the mode actually in force, the mode that was asked for, the light sensor, the
+configured fps and gop, client count and frame counters — written to a temp name and
+renamed so the CGI cannot read it half-written. The CGI puts that next to the two
+gpio nodes in `act=status` (`night_set`, `night_mode`, `ldr`, `ir_led`, `ircut`,
+`akrtsp`, `ak_pid`), and the page shows **asked** and **in force** side by side:
+
+```
+asked: night  |  ISP now: night  |  light sensor: day  |  IR led: on  |  filter: out
+```
+
+That line is the honest version of the earlier finding: the light sensor says
+**day** in a dark room lit only by this camera's own IR, which is exactly why
+`auto` is a button and not the default, and why the sensor is shown rather than
+hidden. A control that repaints itself from the last click is worse than no
+control, so every one of these re-reads the camera: `act=nightmode&state=day|night|auto`,
+`act=irled&state=on|off|get`, `act=ircut&state=0|1`.
+
+Verified in a real browser rather than with curl: `./tools/night-check.mjs` drives
+headless Chrome over CDP, clicks the page's own buttons and only passes when the
+camera reports the state back — mode reaching the ISP, illuminator off and on,
+filter travelling in and out, no page errors, ending with the camera as it was
+found. 11/11 twice, screenshot in `logs/night-panel.png`. The frame comparisons
+behind the two gpio rows come from `tools/ppmdiff.py`, which diffs two PPMs
+pixel-wise: mean brightness cannot show an illuminator doing anything while
+automatic exposure compensates, and it did not.
+
 ## 5. Problems found that are worth fixing
+
+* **The monitoring cost more than the streaming.** The status endpoint needed to
+  know whether `akrtsp` was alive, and the obvious busybox way — walk `/proc`,
+  `cat` each `comm` — forks **once per process**, about 100 forks per poll. The page
+  polls every few seconds, so with a browser open the camera reached **0 % idle and a
+  load average of 11** while `akrtsp` itself was only 24 % of the core: three or four
+  `api` processes, each grinding through `/proc`, were starving the thing they were
+  watching. Fixed by having the server publish its own `pid` in its status file: the
+  CGI now reads one file and confirms the process with the shell's `read` **builtin**
+  (no fork), and the supervisor's own `pids_by_comm` loop does the same. Load with
+  the page open went 11 → 2.9, and 1.6–2.3 with it closed. Worth keeping as a rule
+  for this class of box: on one 400 MHz core, a fork-per-process scan is not a
+  diagnostic, it is a workload.
+* **You cannot overwrite a running binary.** Uploading a fresh build over
+  `/mnt/camrtsp/akrtsp` while it executes fails — `ftpd` answers `553 Error`, which
+  is ETXTBSY wearing a different hat. The working order is: upload as
+  `akrtsp.new`, then `mv -f` it into place (a rename needs no write permission on the
+  running inode, and the old process keeps its own copy until it exits), then restart.
+* **A supervisor with the wrong default binary path fell back to the vendor server —
+  quietly, and correctly.** After the move to the card, starting `run_akrtsp.sh`
+  without `BIN=` in the environment still looked for `/tmp/akrtsp`, found nothing,
+  and did exactly what it is designed to do: started the vendor server and exited.
+  Nothing was broken, and the log said `no /tmp/akrtsp on disk; falling back to the
+  vendor server` — which is the only reason it was noticed at all. `BIN` now defaults
+  to whichever install location exists. Two lessons: a default path is a deployment
+  decision, and a supervisor that explains what it did and why is what turns a
+  surprise into a five-second read of a log line.
+* **Two more greps that matched themselves,** after the same trap had already been
+  documented twice here. `ps | grep -c "custom/rtsp"` reported the vendor server
+  running when nothing was running (the grep's own argv), and
+  `pkill -f camweb-chrome` killed **the shell that ran it**, because that string was
+  in its command line. The safe forms used here now: compare `/proc/<pid>/comm`
+  exactly, and when matching a command line, match on the *executable's* own
+  attributes rather than a string the caller also typed.
 * **A supervisor that matched its own grep.** `grep -l run_takeover
   /proc/[0-9]*/cmdline` — meant to notice a handover in flight — also matched **the
   grep process itself**, whose argv contains the word it is looking for. The
@@ -1075,21 +1203,33 @@ supervisor from starting the vendor binary while a real server is still streamin
 5. Optional: enable `onvif` for NVR use, and drop the two dead lines in
    `config.sh` (`ak_adec_demo` beeps and `vpn/vpn.sh`) — both are noise, a little
    CPU, and extra surface.
-6. **`akrtsp` is live on :554 — let it run for a few days, then decide about boot.**
-   Measured against the real NVR with the same method on both sides: 18 % of the
-   core against the vendor's 32 %, 20.2 fps against 13.6, GOP 1.0 s against
-   2.6 s, correct RTP timestamps against 526× wall time, the kernel `aec_task`
-   now idle, and ~1.3 MB more free memory (see "Deployed" above). Night mode is the
-   launcher default (see "The purple image") and a supervisor restarts it and falls
-   back to the vendor binary after three failed starts (see "Supervision"), so the
-   two things that used to be open - "will it come back if it dies" and "is the
-   picture right" - are answered. What is left is one decision: **both the binary
-   and the scripts live in `/tmp`, which is tmpfs**, so a reboot still brings the
-   stock binary back. To make it permanent, copy the binary plus `run_akrtsp.sh`
-   and `run_takeover.sh` onto the card (e.g. `/mnt/camrtsp/`), replace the
-   `/mnt/Factory/custom/rtsp &` line in `/mnt/Factory/config.sh` with the
-   supervisor, and leave `/mnt/Factory/custom/rtsp` itself untouched as the
-   rollback. Nothing in `config.sh` has been changed for any of this.
+6. **`akrtsp` on :554 is now the permanent arrangement — soak it, then look at the
+   two open questions.** Measured against the real NVR with the same method on both
+   sides: 18 % of the core against the vendor's 32 %, 20.2 fps against 13.6, GOP
+   1.0 s against 2.6 s, correct RTP timestamps against 526× wall time, the kernel
+   `aec_task` now idle, and ~1.3 MB more free memory (see "Deployed" above). Night
+   mode is asked for in a file the UI writes (see "Day/night from the browser"), a
+   supervisor restarts the server and falls back to the vendor binary after three
+   failed starts ("Supervision"), and the whole thing is installed on the card and
+   starts from `config.sh` ("Persistent: the card, not `/tmp`"), proven by rebooting
+   the camera. What used to be open — "will it come back if it dies", "is the
+   picture right", "does it survive a reboot" — is answered.
+   During the soak, the things worth actually looking at rather than trusting:
+   `/tmp/akrtsp_sup.log` should stay empty apart from the one boot line (any
+   `starting akrtsp` line means something died); `./tools/aknet.py --watch 15 akrtsp`
+   for CPU, `oom_score_adj` and Send-Q on the NVR sockets; load average around
+   1.6–2.3 with the NVR attached and no browser, ~2.9 with the page open;
+   `./tools/rtsp_probe.py` for fps/GOP/gaps; `./tools/rgbshot.py` for the colour
+   signature, since `R−G` drifting positive is the fingerprint of the ISP having
+   fallen back to day mode.
+   Still genuinely open, in order of usefulness: (a) **UDP transport and RTCP** —
+   every real client here is TCP and interleaved, so this is compatibility for
+   hypothetical clients, not a fix; (b) **a day/night decision based on the image**
+   rather than on a flag, which needs the ISP statistics that `libakispsdk` exports
+   without declaring them (see "The purple image") — until then `auto` follows a
+   light sensor that is wrong indoors, and the UI says so; (c) **what the IR
+   illuminator should do on a schedule** — the gpio is controllable and measured, but
+   nothing decides when to touch it.
 
 ## 7. Do not touch
 
@@ -1130,13 +1270,17 @@ anyka-cam/
   src/run_server_test.sh run akrtsp on :8554 with the real clients against it
   src/run_idle_test.sh   akrtsp with no client at all: lifetime and memory
   src/run_takeover.sh    move :554 from the vendor binary to akrtsp; --restore undoes it
-                         (AK_ARGS defaults to --force-night night: the ISP boots in day
-                         mode and this room is lit only by IR - see "The purple image")
+                         (AK_ARGS defaults to --mode-file /mnt/camweb/daynight.conf
+                         --force-night night: the mode the UI chose wins, the flag is
+                         the fallback - the ISP boots in day mode and this room is lit
+                         only by IR, see "The purple image")
   src/run_akrtsp.sh      supervisor: restart akrtsp when :554 has no owner, stand down
                          for the vendor server or a handover in flight, fall back to
                          the vendor binary after 3 failed starts, one instance, log to
                          /tmp/akrtsp_sup.log (BIN/LOG/SUP/PIDF/NOFALLBACK from the
-                         environment so failure paths can be tested without a live run)
+                         environment so failure paths can be tested without a live run;
+                         BIN defaults to /mnt/camrtsp/akrtsp when that exists, else
+                         /tmp/akrtsp - it has to be right in both places)
   src/fake_akrtsp.sh     a server that always fails, for testing the supervisor's
                          restart counting and give-up path safely
   src/run_watch.sh       process CPU from /proc/<pid>/stat over a measured interval
@@ -1164,6 +1308,15 @@ anyka-cam/
   tools/cam.py           telnet shell helper
   tools/deploy.py        deploy / verify / promote / revert / stop / --preview
   tools/live.py          install and test the preview relay; --test, --reboot
+  tools/night-check.mjs  drive the day/night and IR panel in headless Chrome over
+                         CDP: click the page's own buttons and only pass when the
+                         camera reports that state back (mode in force, illuminator,
+                         filter position), then leave the camera as it was found;
+                         logs/night-panel.png
+  tools/ppmdiff.py       pixel-wise diff of two rgbshot PPMs: mean |diff| per
+                         channel, share of pixels moved, luminance delta. The only
+                         way to see an IR illuminator do anything while automatic
+                         gain holds the mean brightness still
   tools/browser-check.mjs  drive headless Chrome over CDP: press the page's
                            own button, require a decoded frame and an advancing
                            currentTime, save logs/live-preview.png
@@ -1204,7 +1357,19 @@ Camera side:
 /mnt/camweb/live/stop_live.sh stop + the persistent block switch
 /mnt/camweb/live/disable    present = relay blocked (created by --off)
 
-/mnt/Factory/config.sh      edited: the runner line replaced the stock httpd line
+/mnt/camrtsp/akrtsp            our stream server, started at boot (md5-checked)
+/mnt/camrtsp/run_akrtsp.sh     its supervisor, started by config.sh
+/mnt/camrtsp/run_takeover.sh   handover and --restore, so rollback survives a reboot
+/mnt/camweb/daynight.conf      wanted ISP mode: day|night|auto — the UI writes it
+
+/mnt/Factory/config.sh      edited twice: our httpd runner replaced the stock httpd
+                            line, and the supervisor replaced `/mnt/Factory/custom/rtsp`
+                            (commented, not deleted; the vendor binary is untouched)
+/tmp/akrtsp.log             akrtsp's own log          (RAM, cleared on reboot)
+/tmp/akrtsp_sup.log         supervisor log            (RAM, cleared on reboot)
+/tmp/akrtsp_sup.pid         supervisor pidfile        (RAM)
+/tmp/akrtsp.status          what the UI reads: pid, mode in force, mode asked for,
+                            light sensor, fps, gop, clients, frame counters (RAM)
 /tmp/camweb_web.log         runner log            (RAM, cleared on reboot)
 /tmp/camweb_req.log         API request log       (RAM, cleared on reboot)
 ```
