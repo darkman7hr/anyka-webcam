@@ -172,13 +172,20 @@ Knobs, in `live/live.conf`:
 | `LIVE_RESTART_MAX` | 3 | restart attempts before the supervisor gives up |
 
 `./live.py --off` writes `/mnt/camweb/live/disable` so the page cannot start the
-relay at all (survives reboot); `--on` removes it.
+relay at all (survives reboot); `--on` removes it. The page's **Relay** switch
+writes and clears that same file through `act=live_off` / `act=live_on`, and both
+of them commit the flag, read it back, print the reply, and only then run the
+teardown in the background — on this box the web server serves one connection at a
+time, so a CGI that spends three seconds tearing things down delays every other
+request the page has outstanding, and that is how the switch broke in the first
+place.
 
 ## 7. Prove it works
 
     ./live.py --test         # 21 checks, and it leaves the camera idle afterwards
     ./live.py --idle-test    # the idle reaper stops the relay by itself
     ./live.py --race-test    # 4 concurrent live_start -> exactly one supervisor, page still answers
+    ./live.py --toggle-test  # the page's Relay switch, both ways, at the API level
     ./live.py --logs         # /tmp/live.log off the camera
 
 `--test` is the one that matters: it starts the relay, pulls real segments off
@@ -186,6 +193,17 @@ relay at all (survives reboot); `--on` removes it.
 clean again — no go2rtc process, ports 1984/8554 closed, `overcommit_memory`
 back to its previous value, vendor `oom_score_adj` back to 0. On this board the
 sequence ran 21/21 after a fresh boot.
+
+`--toggle-test` checks the page's **Relay** switch at the API level: it blocks and
+unblocks repeatedly and asserts the contract the switch rests on — the flag appears
+and clears every time in both directions, `live_off` answers *while the relay is
+still running* and the backgrounded teardown stops it a moment later, a stop does
+not kill a relay started after it, and the new supervisor still owns its lock and
+pidfiles. 18/18, and it leaves the camera as it found it. The browser half is
+`./switch-check.mjs` (needs the optional Chrome/Node from section 1): it clicks the
+real button and only passes when the button and the camera's own card agree in both
+directions, including a status poll fired deliberately during a click and a double
+click that must change the state exactly once. 12/12.
 
 Then in a browser: open the page, press **Start live preview**. The relay is up
 in a few seconds and video appears. If it starts and then goes black, see
@@ -269,7 +287,8 @@ the viewer, is the only working preview on this board.
 | `Illegal instruction` running go2rtc | not an ARMv5 build — build with `GOARM=5 CGO_ENABLED=0`, see section 5 |
 | go2rtc dies instantly, no log line | address space refused at `execve`; start it through the supervisor (`--start`), which sets `overcommit_memory=1` |
 | relay starts, panel says live, no picture | usually joining a long-running session at a segment the decoder cannot start from; the page re-joins at the head of the window then falls back to the live edge — reload the page |
-| panel says "blocked on this camera" | `/mnt/camweb/live/disable` exists — `./live.py --on` |
+| panel says "blocked on this camera" | `/mnt/camweb/live/disable` exists — press the page's **Relay: blocked** switch (or `./live.py --on`) |
+| Relay switch flips and never comes back | the CGI answers before the teardown now, so this should not happen; `./live.py --toggle-test` and `./switch-check.mjs` pin it down, and `./live.py --logs` shows the teardown |
 | `live_start` returns but nothing happens | `./live.py --logs`; also check free memory — the supervisor refuses when available memory is below `LIVE_MIN_AVAIL_KB` |
 | picture lags further and further behind | you are on the HLS fallback - the page says "webrtc unavailable (...) - using HLS segments"; check UDP reachability to :8554 and that the deployed page is current |
 | UI slow or timeouts | one core; while a preview is running the page polls less often, and CGIs queue. Close other viewers |

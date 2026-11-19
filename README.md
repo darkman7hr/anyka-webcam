@@ -172,6 +172,7 @@ cd tools
 ./live.py --off / --on   # persistent block/unblock on the card (/mnt/camweb/live/disable)
 ./live.py --test         # 21 checks: media really flows, and the camera is back clean
 ./live.py --idle-test    # prove the idle reaper shuts it down alone
+./live.py --toggle-test  # the relay switch both ways: 18 checks on CGI + supervisor
 ./live.py --reboot       # reboot, wait for the UI, then --boot-check
 ./live.py --logs         # supervisor log (/tmp/live.log)
 ```
@@ -261,9 +262,9 @@ Why the guards are there (all of them were measured, see
   restarts it and the page's reconnect loop re-attaches, so a viewer sees a
   hitch; the cap stops a crash loop from outlasting the camera.
 
-To take it back off: `./live.py --off` blocks it at once; `rm -rf
-/mnt/camweb/live` removes it permanently. Nothing else has to be undone, because
-nothing was added to the boot path.
+To take it back off: the page's **Relay** switch, or `./live.py --off`, blocks it
+at once; `rm -rf /mnt/camweb/live` removes it permanently. Nothing else has to be
+undone, because nothing was added to the boot path.
 
 
 
@@ -368,6 +369,73 @@ into a CPU hog: measured RSS with one viewer pulling 720p was ~13 MB, so 12MiB
 sat exactly on the working set, the GC ran constantly on the single core, and the
 relay kept dropping the browser's stream. The preview source is also now
 **`/vs1` (640x480)** rather than `/vs0` (1280x720) — same reason, measured.
+
+### Stopping the relay: the switch that only worked one way
+
+The page's relay switch could block/stop the relay but could never undo it: the
+button changed and never came back, and pressing start then told the person who
+had just flipped it back that the relay was "disabled on the camera
+(rm /mnt/camweb/live/disable)" — advice for a file they had already removed. Four
+separate faults, none of them where the symptom pointed; all four now have a
+check that fails if they come back.
+
+* **The page had stopped asking the camera.** `poll()` assigned to
+  `$("rtspalt")`, an id that no longer exists in `index.html`. The assignment
+  threw inside the `.then`, so every line after it in that handler stopped
+  running — on every poll, forever. The header stayed healthy while the relay
+  line, its links and the switch label were frozen; from the page it was not even
+  possible to see the switch was wrong. Writes to card lines now go through
+  `$set()` (a missing element costs its own line and nothing else) and drawing
+  moved into `renderStatus()` behind a `try`, because the `.catch` cannot tell
+  "the camera did not answer" apart from "this page threw while drawing" and
+  treated both as a grey dot.
+* **The switch read its own state off its own label.** Which action a click
+  meant came from the button's text, so a status reply that left before the
+  click and landed after it could put the old word back, and every later click
+  asked for the state the camera was already in. The state now lives in `lv.off`,
+  and `lv.epoch` says which replies are still allowed to speak for it; one
+  mutation is in the air at a time (`lvMutate()`), buttons are disabled while it
+  is in flight, and the switch opens as `Relay: reading…` rather than guessing.
+* **The CGI answered too late.** `live_off` ran the entire teardown before
+  printing its reply, holding the camera's one-connection web server for ~3 s —
+  which is what guaranteed a stale poll was in flight over the click. It now
+  writes the flag, reads the file back, prints the reply, and forks the teardown
+  *after* it; `live_off`/`live_on` report the state they verified, not the one
+  they attempted. Same rule `live_start` already follows above: commit the
+  intent, answer, do the slow part afterwards.
+* **Backgrounding the teardown broke the lock contract.** `stop_live.sh`
+  re-read the pidfiles every round, so it could signal a relay started *after*
+  the stop, and it unlinked the lock and pidfiles unconditionally — taking them
+  away from a fresh supervisor, which concluded it had been superseded by an
+  empty pid, exited without cleanup, and left go2rtc holding :1984 and :8554
+  behind empty pidfiles. The relay was up, the page said it was not, and nothing
+  could stop it. The teardown now snapshots the supervisor and relay PIDs once
+  and chases only those, and deletes only files still naming a PID it saw. A
+  supervisor whose lock directory vanishes underneath it retakes the lock instead
+  of leaving. (The SIGKILL escalation was also unreachable: `[ $i -ge 6 ]` inside
+  `while [ $i -lt 6 ]`.)
+
+Two rules out of that, worth keeping: everything on this box serialises behind
+the CGI's one connection, so any slow handler delays every other request the page
+has outstanding; and no UI may derive state from the text of its own widget. The
+start-refusal message also now names the page's own switch instead of telling
+somebody at a browser to `rm` a file on the card.
+
+`jhdr()` emits CRLF on **every** header line. It mixed busybox's CRLF status line
+with bare `LF` from `echo`: browsers forgive that, Node's HTTP parser does not, so
+the API was unreadable from any strict client — which is exactly why the browser
+harnesses could not see what curl could.
+
+Verified on the device: `./tools/switch-check.mjs` (new) drives the switch in
+headless Chrome and compares the button against what the camera's own card
+reports — **12/12**, including a status poll fired deliberately during a click
+and a double click that must change the state exactly once. `./tools/live.py
+--toggle-test` (new) covers the CGI and supervisor contract — **18/18**,
+including "the reply goes out while the relay is still running", "the background
+teardown really does stop it", "a stop does not kill a relay started after it"
+and "the new supervisor still owns its lock and pidfiles". `night-check.mjs` is
+still 11/11 after the `poll()` restructuring, and both suites leave the camera in
+the state they found it.
 
 ### The browser preview: what works, and what go2rtc does to Chrome
 
@@ -1515,6 +1583,11 @@ anyka-cam/
                          camera reports that state back (mode in force, illuminator,
                          filter position), then leave the camera as it was found;
                          logs/night-panel.png
+  tools/switch-check.mjs the relay switch in headless Chrome over CDP: click it and
+                         require the button and the camera's own card to agree in
+                         both directions — with a status poll fired deliberately
+                         during a click, and a double click that must change the
+                         state exactly once; 12/12
   tools/ppmdiff.py       pixel-wise diff of two rgbshot PPMs: mean |diff| per
                          channel, share of pixels moved, luminance delta. The only
                          way to see an IR illuminator do anything while automatic
@@ -1560,7 +1633,8 @@ Camera side:
 /mnt/camweb/live/live.conf  its knobs: ports, LIVE_IDLE_S, memory guards
 /mnt/camweb/live/run_live.sh  supervisor started by the CGI, never at boot
 /mnt/camweb/live/stop_live.sh stop + the persistent block switch
-/mnt/camweb/live/disable    present = relay blocked (created by --off)
+/mnt/camweb/live/disable    present = relay blocked (written by the page's Relay
+                            switch, or --off; removed by the switch, or --on)
 
 /mnt/camrtsp/akrtsp            our stream server, started at boot (md5-checked)
 /mnt/camrtsp/run_akrtsp.sh     its supervisor, started by config.sh
