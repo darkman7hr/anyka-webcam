@@ -39,7 +39,7 @@ WITH_BINARIES=${WITH_BINARIES:-0}
 trap 'rm -rf "$STAGE"' EXIT
 
 mkdir -p "$STAGE/$NAME" "$DIST"
-for d in webui live src; do
+for d in webui live src time; do
     cp -R "$ROOT/$d" "$STAGE/$NAME/"
 done
 mkdir -p "$STAGE/$NAME/tools"
@@ -111,11 +111,19 @@ fi
     echo "day/night   : ISP mode, IR illuminator and IR-cut filter, manual or auto;"
     echo "            : auto follows the ISP auto-exposure gain - this board's own"
     echo "            : light sensor reads DAY with the room light on and off"
+    echo "clock       : NTP service (time/run_time.sh) plus TZ from its config; the"
+    echo "            : stream server publishes clock_state and the exact line it"
+    echo "            : burns into the picture in /tmp/akrtsp.status"
+    echo "osd         : burned-in date/time on both channels (--osd-time). The"
+    echo "            : board's libmpi_osd paints one line per 16-row block of the"
+    echo "            : rect and refuses a shorter one, so the date is stamped"
+    echo "            : twice in a 32-row rect - measured, see README"
 } > "$STAGE/$NAME/VERSION"
 
 chmod 755 "$STAGE/$NAME"/tools/*.py "$STAGE/$NAME"/tools/*.mjs \
           "$STAGE/$NAME"/tools/*.sh "$STAGE/$NAME"/tools/diag.sh 2>/dev/null
 chmod 755 "$STAGE/$NAME"/live/*.sh 2>/dev/null
+chmod 755 "$STAGE/$NAME"/time/*.sh 2>/dev/null
 chmod 755 "$STAGE/$NAME"/live/go2rtc-armv5 2>/dev/null
 chmod 755 "$STAGE/$NAME"/src/*.sh 2>/dev/null
 chmod 644 "$STAGE/$NAME"/src/*.c "$STAGE/$NAME"/src/*.h \
