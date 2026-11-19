@@ -17,6 +17,12 @@ Two independent things, either of which can be installed alone:
    HLS/fMP4 on `:1984`. The viewer's browser decodes the H.264; the camera only
    muxes and serves. It shuts itself down 300 s after the last viewer.
 
+Sections 14 and 15 are two more independent pieces, also optional and also
+removable on their own: **14** replaces the vendor's capture/encode/RTSP binary
+with `akrtsp` (which is what makes the day/night control and the next item
+possible), and **15** puts an NTP clock on the camera and burns the date into the
+picture, so the NVR's recordings carry a time that means something.
+
 Measured cost while previewing, on a 36 MB single-core board: `go2rtc` RSS
 ~9-12 MB, load average rises to ~10 and falls back to ~2.5 within a couple of
 minutes after the relay exits, and all ~9 MB of memory comes straight back.
@@ -335,6 +341,11 @@ and everything else keeps working.
 | `/tmp/live.log`, `/tmp/live.json`, `/tmp/camweb_live.lock` | the running supervisor | it cleans these up itself |
 | `/mnt/camrtsp/akrtsp`, `run_akrtsp.sh`, `run_takeover.sh` | section 14 (stream server) | yes: uncomment the vendor line in `config.sh` |
 | `/mnt/camweb/daynight.conf` | the UI (`act=nightmode`) and you | it is just the wanted mode; delete it and `--force-night` decides |
+| `/mnt/camweb/akrtsp.args` | `osd.py` (the option line the supervisor starts `akrtsp` with) | it is just options; `--osd-time` in it turns the overlay on |
+| `/mnt/camweb/time/` (`run_time.sh`, `time.conf`) | `time.py --install` | `time.py --restore` |
+| `/mnt/camrtsp/lib/libmpi_osd.so` | `osd.py --install` (the vendor OSD library from the rootfs dump, see `SDK_LIB`) | `osd.py --off`, then it is unused |
+| `/tmp/camweb_time.status`, `/tmp/camweb_time_last`, `/tmp/camtime.log` | the clock supervisor | it cleans these up itself |
+| a clock line in `/mnt/Factory/config.sh` | `time.py --install` (backed up and syntax-checked; it stops parsing if broken) | `time.py --restore` |
 | a second line in `/mnt/Factory/config.sh` | section 14, by hand | one-character uncomment of `# /mnt/Factory/custom/rtsp &` |
 
 Never touched: `/mnt/Factory/custom/web_interface/www` (stock docroot, left in
@@ -357,8 +368,14 @@ all of them reversible.
 * **A forgotten browser tab keeps the relay running.** The 300 s idle timer only
   starts once the viewer stops beating; `--stop` is the manual escape hatch.
 * **No JPEG snapshot** on this unit (section 9).
-* **The camera's clock is wrong after boot** (1970 until the vendor daemon
-  syncs), so log timestamps are relative, not wall-clock.
+* **The camera has no rtc and no battery.** After boot it sits at the epoch plus
+  uptime, and the vendor daemon that used to learn the time from its cloud bind is
+  not running here, so log timestamps are relative, not wall-clock — unless section
+  15 is followed. Until that service says `synced`, `akrtsp --osd-time` prints
+  `NO TIME` into the picture rather than a date it cannot vouch for.
+* **The burned-in date is stamped twice, 16 px apart.** Not a bug in this code:
+  `libmpi_osd` on this generation stamps the string once per 16-row block of its
+  rect and refuses any rect shorter than twice the font size. Section 15.3.
 
 ## 14. The stream server (`akrtsp`) and day/night
 
@@ -461,5 +478,101 @@ Expected on this board: 20 fps, one key frame per second, 0 sequence gaps, the
 night frame R=G=B across the full 0..255 range (a purple frame means the ISP is in
 day mode under the illuminator; a black one means the filter is in while the lamp
 is on), and a load average of 1.6-2.9 with the stream and the page open.
+
+## 15. The clock, and the date burned into the picture
+
+The camera has no rtc, so nothing about the date works until section 15.1 is
+done. The overlay is optional; the clock is what makes it worth having, and
+`akrtsp --osd-time` deliberately draws `NO TIME` until that clock says `synced`.
+
+### 15.1 Install the clock
+
+```sh
+python3 tools/time.py --install
+python3 tools/time.py --status
+python3 tools/time.py --test
+python3 tools/time.py --sync                                  # ask for a sync now
+python3 tools/time.py --tz 'CET-1CEST,M3.5.0,M10.5.0/3'
+python3 tools/time.py --logs
+```
+
+`--install` puts `run_time.sh` and `time.conf` in `/mnt/camweb/time/`, adds one
+boot line to `/mnt/Factory/config.sh` (backed up and syntax-checked, and put back
+if it stops parsing) and starts it. Edit `time.conf` for your own NTP servers and
+leave `min_valid` alone: it is what stops one bogus reply from setting the camera
+to 2009. The zone has to be a POSIX rule, not a name — uClibc on this board has no
+zoneinfo database, so a named zone silently means UTC.
+
+`--test` is deliberately not "the clock reads a plausible number", because 1970
+plus uptime is plausible on a box with no rtc. It compares the camera's epoch with
+this workstation's, checks that the zone the overlay prints in is the one in
+`time.conf`, and checks that the boot line is still in `config.sh` — which is the
+only reason any of it survives a reboot. `--restore` takes the boot line out and
+stops the service.
+
+### 15.2 Turn the overlay on
+
+```sh
+python3 tools/osd.py --install       # akrtsp + run_akrtsp.sh + libmpi_osd.so
+python3 tools/osd.py --on --pos br   # tl | tr | bl | br
+python3 tools/osd.py --status
+python3 tools/osd.py --shot          # measure the text in a real frame
+python3 tools/osd.py --off
+```
+
+`--install` reads the vendor OSD library from `$SDK_LIB` on your PC (default
+`/home/darkman/opt/anyka_v380ipcam_experiments/rootfs_v1basic/rootfs/usr/lib`;
+set it if your rootfs dump lives elsewhere) and puts it at
+`/mnt/camrtsp/lib/libmpi_osd.so`. It also refuses to install unless
+`/usr/local/ak_font_16.bin` is readable on the camera, because this build of the
+library has no builtin font — the header's `ak_osd_set_font_size` is not in it.
+
+The options end up in `/mnt/camweb/akrtsp.args`, and the overlay is set up when
+the server starts: there is no runtime switch, so every change here restarts
+`akrtsp` and the supervisor brings it back in roughly 8 s. `osd.py` rewrites only
+the flags it owns and carries the day/night ones through untouched, because two
+tools rewriting one argument line is how a deployment loses its night mode
+overnight.
+
+| `osd.py` | `akrtsp` | default | meaning |
+|---|---|---|---|
+| `--pos` | `--osd-pos` | `br` | corner the rect is anchored to |
+| `--size` | `--osd-size` | 16 | passed to `ak_osd_set_font_file`. On this board it only sets the minimum rect height (twice its value); it does **not** scale the glyphs |
+| `--rect-h` | `--osd-rect-h` | 2×size | rect height: shorter than 2×size the library refuses it, shorter than 32 the display path truncates it |
+| `--fmt` | `--osd-fmt` | `%Y-%m-%d %H:%M:%S` | the line, as strftime |
+| `--xoff` / `--yoff` | `--osd-xoff` / `--osd-yoff` | 0 | offset inside the rect, clamped per channel |
+| `--osd-sub 0` | `--osd-sub` | 1 | burn the main channel only |
+
+### 15.3 What it produces, the flaw included
+
+`osd.py --shot` on the build described here: main rect `400x32 at 872,680`, sub
+rect `400x32 at 232,440`, 18–20 of 32 rows carrying stroke edges inside the rect
+(13 on the sub stream) and **0** in a same-sized control rect that has no text in
+it. Put the control at the top of the frame when measuring the sub stream: its
+mirror position overlaps the text band, and then it agrees with the rect perfectly
+while proving nothing.
+
+**The date is stamped twice, 16 px apart.** That is the library, not this code:
+`libmpi_osd` on this camera generation stamps the string once per 16-row block of
+its rect, refuses a rect shorter than `2 × --osd-size`, and truncates anything
+below two blocks with its own message (`Small buffer to disp osd, only disp 4
+characters of total 19`). Measured and ruled out: `--size 8 --rect-h 16` (four
+characters), `--size 32 --rect-h 64` (four copies), `--osd-sub 0` (second band
+unchanged), clearing the canvas below the first line after drawing (no effect).
+The library's real signatures, and why the canvas has to be cleared by stepping
+across the rect, are in README, "The date in the picture". One clean line is not
+available through this board's OSD; if the recording needs it, the text has to be
+added after the encoder, on the NVR side.
+
+### 15.4 When it is wrong
+
+| symptom | first check |
+|---|---|
+| `osd_text=NO TIME` in `/tmp/akrtsp.status` | `python3 tools/time.py --status`; then `--sync` and `--logs` |
+| time in the picture is hours off | `TZ_STR` in `/mnt/camweb/time/time.conf` — `run_takeover.sh` and `run_akrtsp.sh` export it, and the vendor environment sets `TZ=GMT-08:00`, which is exactly what broke once |
+| date right, text nowhere in the picture | `grep 'osd:' /tmp/akrtsp.log` for the rects actually used, then `osd.py --shot`; confirm `/usr/local/ak_font_16.bin` is readable |
+| line clipped to `2026-11-19 1` | the rect is narrower than the string's real advance, which is the font file's 16 px per character — shorten `--fmt` |
+| handover never takes `:554` after adding the overlay | `LD_LIBRARY_PATH` in `run_takeover.sh` has to include `/mnt/camrtsp/lib`; without it `akrtsp` dies on a missing `libmpi_osd.so` and the loop only ever reports "nothing on :554" |
+| overlay settings gone after a reboot | the boot line and `/mnt/camweb/akrtsp.args` are on the card, not in `/tmp`: check both, then `python3 tools/time.py --test` |
 
 

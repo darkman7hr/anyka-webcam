@@ -131,7 +131,9 @@ saved positions · **drag anywhere on the image to aim** · absolute pan/tilt
 entry · live position in the header · white LED · **image mode day / night / auto
 and the IR illuminator and IR-cut filter as separate switches, each showing what
 the camera reports rather than what was clicked** (see "Day/night from the
-browser") · reboot · RTSP URLs click to copy.
+browser") · **the date and time burned into both streams**, from an NTP service
+the camera runs itself (see "The date in the picture") · reboot · RTSP URLs click
+to copy.
 
 Naming a position opens a text field **inside its own card**, delete asks twice
 (the `×` turns into "Sure?"), and the token is typed into a panel rather than a
@@ -1284,6 +1286,102 @@ comparisons behind the two gpio rows come from `tools/ppmdiff.py`, which diffs t
 PPMs pixel-wise: mean brightness cannot show an illuminator doing anything while
 automatic exposure compensates, and it did not.
 
+### The date in the picture: NTP, a zone rule, and an OSD library that does not match its header
+
+A recording that cannot be tied to a time is the one defect in a surveillance
+camera that cannot be corrected afterwards. This board has no rtc and no battery
+— no `/sys/class/rtc` at all — and the vendor's own way of learning the time (its
+cloud bind, which logs `utc_time: 1638933395` and `timezone: 8`) is not running
+here. Measured on a box that had been up 13 hours, before any of this:
+
+```
+date            Thu Jan  1 13:30 GMT 1970
+TZ              GMT-08:00        (the vendor's, printed as "GMT")
+```
+
+While the date only ever appeared in a log line, that was survivable. It stopped
+being survivable the moment the date was burned into the picture, because the
+overlay is composited by the ISP **before** the encoder: the NVR's files carry it,
+and a wrong date cannot be taken back out of a recording. Three pieces follow.
+
+**The clock** — `time/run_time.sh` with `time/time.conf`, installed into
+`/mnt/camweb/time/` by `tools/time.py --install`. SNTP against the servers in its
+config, retries with backoff, a `min_valid` epoch guard (`1230768000`) so a bogus
+reply cannot put the camera in 2009, `USR1` meaning "sync now", and one boot line
+in `/mnt/Factory/config.sh` (written with a backup and a syntax check, and
+`--restore` takes it out again). It publishes `/tmp/camweb_time.status` (`state`,
+`peer`, `last_sync`, `tz`, `pid`) and `/tmp/camweb_time_last`.
+
+**The zone** — uClibc on this board carries no zoneinfo database, so a named zone
+like `Europe/Zagreb` silently means UTC. The rule has to be POSIX, and there is
+then exactly one place that says what zone this camera is in:
+`TZ_STR="CET-1CEST,M3.5.0,M10.5.0/3"` in `time.conf`, which `run_takeover.sh` and
+`run_akrtsp.sh` source and `export TZ` from. That sourcing is what fixed the
+burned-in clock being hours off: the handover script inherited the vendor login's
+`TZ=GMT-08:00`. From the live status file, epoch and painted text from the same
+second:
+
+```
+clock=1795110126              # 2026-11-19 17:42:06 UTC
+osd_text=2026-11-19 18:42:06  # CET = UTC+1, correct for November
+```
+
+**The overlay** — `akrtsp --osd-time`, through the ISP's own OSD (`libmpi_osd`),
+the same path the vendor firmware used on this board (its boot log shows
+`ak_osd_set_font_file`, `ak_osd_init ch:0 fontS:32 res_w:1280 res_h:720` and a
+`ak_osd_set_rect` of 1280x64), with the font still on the card at
+`/usr/local/ak_font_16.bin`. It costs the 400 MHz core nothing measurable,
+because it is hardware, not software compositing. The server redraws when the
+minute changes — never per frame — and when the clock service has not confirmed a
+date it paints the words `NO TIME` rather than a date it cannot vouch for. The
+status file says all of it in words: `osd`, `osd_text`, `clock`, `clock_state`,
+`clock_peer`, `clock_last`.
+
+The library is the reason this took longer than it should have. `ak_osd.h` in the
+SDK dump declares thirteen functions; the `libmpi_osd.so` this generation ships
+exports ten, and the linker says so about `ak_osd_set_font_size`,
+`ak_osd_set_rect_enable` and `ak_osd_set_edge_color`. The static `.a` in the same
+dump has them, and is **not** used: it belongs to a newer SDK generation than this
+board's kernel and libraries. What is actually called:
+
+| published header | this board's `.so` |
+|---|---|
+| `ak_osd_set_rect(vi, osd_chn, x, y, w, h)` (7 args in the newer header) | `ak_osd_set_rect(vi, channel, x, y, w, h)` — the rect index is gone |
+| `ak_osd_draw_str(chn, xoff, yoff, unsigned short *str, len)` | same five, and `chn` is the **video** channel |
+| `ak_osd_clean_str(...)` | `ak_osd_clean_str(channel, xoff, row, -, -)`: the loop counter starts at `xoff` and runs up to the stored font height, and `row` is the first row cleared — so one call clears roughly one 16-row block. Put a width where the counter wants an x and it returns success having cleared nothing |
+
+**What the geometry can and cannot do.** Nothing documents this and the SDK's own
+example is inside `#if 0`, so it was measured:
+
+| attempt | result |
+|---|---|
+| rect `400x32`, font 16, bottom-right | works, and paints the date **twice**, 16 px apart — the library stamps the string once per 16-row block of the rect |
+| rect `200x16` (`--size 8 --rect-h 16`) | `set_rect` accepts it, the display path then truncates: `Small buffer to disp osd, only disp 4 characters of total 19` |
+| `--size 32 --rect-h 64` | four copies: the stamp pitch is the font file's 16 rows, whatever `--osd-size` says |
+| `--osd-sub 0` (main channel only) | second band unchanged — it is not the other channel bleeding in |
+| clearing the canvas below the first line after drawing | no effect |
+
+So 32 rows is the smallest honest rect, and the date is stamped twice. Two real
+bugs were found on the way and are fixed in `akrtsp`: the canvas is now cleared by
+stepping `ak_osd_clean_str` across the rect — without that, stale text from the
+previous minute, from the previous geometry, and from the previous **process**
+(the OSD DMA canvas comes back from the pool uninitialised) stays burned into the
+recording beside the current date — and the rect width follows the font's real
+16 px advance instead of `--osd-size`, which is what had been clipping the line
+to `2026-11-19 1`.
+
+**How it is proved.** `tools/osd.py --shot` grabs one key frame and counts hard
+left-to-right luma transitions per row inside the rect *the server logged*,
+against a same-sized control rect elsewhere in the frame: 18–20 of 32 rows with
+edges in the rect and **0** in the control on the main stream (`400x32 at 872,680`),
+13 of 32 and **0** on the sub one (`400x32 at 232,440`). Where the control goes is
+part of the measurement: on the 640-wide sub stream a 400-wide rect has no mirror
+position that does not overlap the text itself, and an overlapping control matches
+the rect perfectly while proving nothing. Frame on/off diffs are useless here too:
+restarting the server reinitialises the ISP, the exposure moves, and two scene
+bands with no text in them at all correlate at 0.96 — which is also why "the ink
+numbers moved" is not evidence of anything.
+
 ## 5. Problems found that are worth fixing
 
 * **A command that was accepted, reported as successful, and never carried out.**
@@ -1545,6 +1643,11 @@ anyka-cam/
                          driver (make irprobe): level 1=day 0=night, day 1000..2000 /
                          night 2..618 here - the measurement that showed the sensor
                          reports DAY in a dark IR-lit room
+  time/run_time.sh       the clock as a service: SNTP with backoff, a min_valid
+                         guard so a bad reply cannot set the date to 2009, USR1 for
+                         "sync now", publishes /tmp/camweb_time.status
+  time/time.conf         the NTP servers, min_valid, and TZ_STR - the POSIX zone
+                         rule, because uClibc here has no zoneinfo database
   tools/rtsp_probe.py    measure an RTSP stream against the wall clock: fps, GOP,
                          seq gaps, RTP timestamps (ffmpeg's -t cannot tell you this)
   tools/rgbshot.py       one real key frame from the live stream, as numbers: mean
@@ -1578,6 +1681,15 @@ anyka-cam/
   tools/cam.py           telnet shell helper
   tools/deploy.py        deploy / verify / promote / revert / stop / --preview
   tools/live.py          install and test the preview relay; --test, --reboot
+  tools/time.py          install and aim the clock: --install (plus the boot line
+                         in config.sh), --status, --sync, --tz RULE, --logs,
+                         --restore; --test compares the camera's epoch with this
+                         workstation's, because 1970-plus-uptime looks plausible
+  tools/osd.py           deploy and verify the burned-in date: --on/--off and the
+                         geometry (--pos, --size, --rect-h, --fmt, --xoff/--yoff),
+                         --shot measures the text in a real frame, --test checks
+                         files, md5s, flags and status fields; the flags land in
+                         /mnt/camweb/akrtsp.args and restart the server
   tools/night-check.mjs  drive the day/night and IR panel in headless Chrome over
                          CDP: click the page's own buttons and only pass when the
                          camera reports that state back (mode in force, illuminator,
