@@ -77,7 +77,65 @@
 #include "ak_venc.h"
 #include "ak_drv_ir.h"
 #include "ak_vpss.h"
+#include "ak_osd.h"
 #include "vi_abi.h"
+
+/*
+ * Three of the functions this header declares are NOT this library's signature,
+ * and calling them the header's way draws garbage instead of returning an error.
+ * Read out of the board's own libmpi_osd.so (the one that runs here, "libmpi_osd
+ * V2.0.04", md5 ee2c72dc9e01d9774941b4508b572c58):
+ *
+ *   ak_osd_set_rect(vi, channel, x, y, w, h)          six arguments, not seven
+ *       Its entry code moves r2 into what its own error strings call x and r3
+ *       into y, reads w and h off the stack, never touches a seventh argument,
+ *       and tail-calls the internal osd_set_rect(channel, x, y, w, h). There is
+ *       no per-rect index in this generation: one rect per video channel.
+ *   ak_osd_draw_str(channel, xoff, yoff, str, len)    five arguments, not six
+ *       r0 is range-checked against the two video channels, r1 against the rect
+ *       width minus the font, r2 against the rect height minus the font, and r3
+ *       is the string.
+ *   ak_osd_clean_str(channel, xoff, row, -, -)        five arguments, not six
+ *       r0 is the video channel, r1 is compared against the stored rect width and
+ *       r2 against its height. What it clears: rows from r2 downwards, a fixed
+ *       number of them - its loop counter starts at r1 and runs up to the stored
+ *       font height - each (rect_w - r1)/2 bytes wide (4 bpp: two pixels per byte),
+ *       inside the canvas that rect was allocated in; it ends by calling the
+ *       internal draw_osd() to push the canvas back to the screen. The header's
+ *       second argument - a rect index this generation does not have - is not
+ *       there, and passing a width where the loop counter wants an x makes the
+ *       condition false on the first test: the call returns success having cleared
+ *       nothing (measured). One call covers about one line of the rect, so
+ *       osd_draw() steps the start row across it. Without any clear at all the
+ *       canvas keeps what it had - the last minute's text, the last geometry's
+ *       text, and whatever the previous process left, because the DMA canvas comes
+ *       back from the pool uninitialised - and all of it is burned into the NVR's
+ *       recording beside the current date.
+ *
+ * What sent me to the disassembly: with the header's arguments, the main channel
+ * refused the rect at one corner and the sub channel accepted it at another, and
+ * all four outcomes only make sense if the x you pass lands in osd_chn, the width
+ * lands in y and the height is thrown away - which is what happens. ak_osd_init,
+ * ak_osd_get_max_rect, ak_osd_set_font_file and ak_osd_destroy do match the
+ * header; these three do not.
+ */
+typedef int (*osd_set_rect_fn)(void *vi, int channel, int x, int y, int w, int h);
+typedef int (*osd_draw_str_fn)(int channel, int xoff, int yoff,
+			       const unsigned short *str, int len);
+typedef int (*osd_clean_str_fn)(int channel, int xoff, int row, int unused1,
+				int unused2);
+
+/* The (void *) hop is deliberate: casting one function pointer type to another
+ * directly makes gcc warn, and the warning would be the only thing standing
+ * between this and a silent mis-call. Held in a variable rather than cast at each
+ * call site, because this toolchain warns at the call ("function called through a
+ * non-compatible type") and the build here is kept warning-free on purpose. */
+static const osd_set_rect_fn osd_set_rect =
+	(osd_set_rect_fn)(void *)ak_osd_set_rect;
+static const osd_draw_str_fn osd_draw_str =
+	(osd_draw_str_fn)(void *)ak_osd_draw_str;
+static const osd_clean_str_fn osd_clean_str =
+	(osd_clean_str_fn)(void *)ak_osd_clean_str;
 
 #define CH_MAIN 0
 #define CH_SUB 1
@@ -126,6 +184,45 @@ static int g_have_ir;			/* did ak_drv_ir_init() give us the filter? */
 static char g_mode_file[160] = "/tmp/akrtsp.cmd";
 static char g_status_file[160] = "/tmp/akrtsp.status";
 static int g_mode_want = -1;		/* last thing the control file asked for */
+
+/*
+ * The clock, and the date burned into the picture.
+ *
+ * This board has no real-time clock (no /sys/class/rtc, no battery) and the
+ * vendor's own way of learning the time - its cloud bind, which logs "utc_time:
+ * 1638933395" at boot - is not running here. Measured on a box that had been up
+ * half a day, date read "Thu Jan  1 13:30 GMT 1970". So the clock is somebody
+ * else's job (/mnt/camweb/time/run_time.sh, which NTPs it and publishes what it
+ * last confirmed) and is nobody's job here - except that once the date is in the
+ * pixels, a wrong one is wrong in every recording the NVR makes and cannot be
+ * corrected afterwards. Hence the rule below: no confirmed sync, no date; the
+ * overlay says NO TIME and the status file says why.
+ */
+static char g_time_status_file[160] = "/tmp/camweb_time.status";
+static long g_clock_now;		/* what our own clock says, this tick     */
+static long g_clock_last_sync;		/* epoch the time service last confirmed  */
+static long g_clock_min_valid = 1230768000L;	/* below this, it is not a date */
+static int g_clock_state;		/* 1 synced, 0 unsynced, -1 no time service */
+static char g_clock_peer[64] = "-";
+
+static int g_osd;			/* 0 off, 1 on, -1 asked for and failed */
+static int g_osd_size = 16;		/* font cell, px; the vendor's bin is 16 */
+static char g_osd_font_file[160] = "/usr/local/ak_font_16.bin";
+static char g_osd_fmt[64] = "%Y-%m-%d %H:%M:%S";
+static char g_osd_pos[8] = "bl";	/* tl tr bl br */
+static int g_osd_margin = 8;
+static int g_osd_ch[N_CH] = { 1, 1 };	/* which encode channels get it */
+static int g_osd_h[N_CH];		/* the rect height each channel accepted */
+static int g_osd_w[N_CH];		/* and its width */
+static int g_osd_clean_warned[N_CH];	/* say once that the clear is failing */
+static int g_osd_color = -1, g_osd_bg = -1;	/* -1: leave the library's own */
+static int g_osd_alpha = -1;
+static int g_osd_rect_h;			/* rect height; 0 = twice the font */
+static int g_osd_xoff, g_osd_yoff;
+static char g_osd_text[64];		/* exactly what is on the picture now */
+
+static void osd_draw(int force);
+static void clock_poll(void);
 
 /*
  * What the ISP's own auto-exposure is doing right now, as reported by
@@ -667,9 +764,33 @@ static void *producer(void *arg)
 			{
 				long wall = (now - p->ts_first_ms) * 90;
 				long ours = (long)(p->frames * (90000 / p->fps));
+				long fix = wall - ours;
 
-				if (wall - ours > 18000)
-					p->ts_base += (unsigned)(wall - ours);
+				/*
+				 * The correction is bounded, and that is not paranoia:
+				 * `now` is CLOCK_REALTIME and this camera now gets stepped
+				 * by NTP while it runs. An unbounded creep against a clock
+				 * that can jump (boot reads 1970 until the first sync, which
+				 * is 56 years) would push the RTP base forward by years in a
+				 * single frame - monotonic, and useless. Real encoder lag is
+				 * under 1.5% (20.22-20.30 fps for an asked-for 20), so a
+				 * correction that big is not lag; when the delta is more than
+				 * two seconds of media time, the clock moved, and the honest
+				 * answer is to re-anchor the comparison and leave the
+				 * timestamps exactly where they were.
+				 */
+				if (fix > 18000) {
+					if (fix > 180000) {
+						logmsg("ch %s: wall clock moved %.1f s under the "
+						       "stream; timestamps left alone, comparison "
+						       "re-anchored\n", p->name,
+						       (double)fix / 90000.0);
+						p->ts_first_ms =
+							now - p->frames * (1000 / p->fps);
+					} else {
+						p->ts_base += (unsigned)fix;
+					}
+				}
 			}
 			p->ts_cur = p->ts_base + (unsigned)(p->frames * (90000 / p->fps));
 			ts = p->ts_cur;
@@ -902,7 +1023,12 @@ static void write_status(int want, int ldr)
 		"ae_again=%ld\nae_dgain=%ld\nae_idgain=%ld\nae_exp=%ld\n"
 		"auto=%s\nauto_reason=%s\nauto_gain=%ld\nauto_lamp=%d\n"
 		"auto_probe=%d\nauto_dark_gain=%d\nauto_light_gain=%d\n"
-		"ircut=%d\n",
+		"ircut=%d\n"
+		/* The clock and what is burned into the picture. Published because
+		 * "the camera says 1970" is a thing the page should show rather than
+		 * a thing the viewer discovers from a recording six weeks later. */
+		"osd=%s\nosd_text=%s\nclock=%ld\nclock_state=%s\nclock_peer=%s\n"
+		"clock_last=%ld\n",
 		(int)getpid(),
 		g_mode < 0 ? "unset" : (g_mode ? "day" : "night"),
 		want < 0 ? "none" : (want == 2 ? "auto" : (want ? "day" : "night")),
@@ -936,7 +1062,14 @@ static void write_status(int want, int ldr)
 		g_probe_left,
 		g_auto_dark_gain,
 		g_auto_light_gain,
-		g_filter_pos);
+		g_filter_pos,
+		g_osd == 1 ? "on" : (g_osd < 0 ? "failed" : "off"),
+		g_osd_text,
+		g_clock_now,
+		g_clock_state == 1 ? "synced" :
+			(g_clock_state == 0 ? "unsynced" : "no-service"),
+		g_clock_peer[0] ? g_clock_peer : "-",
+		g_clock_last_sync);
 	fclose(f);
 	rename(path, g_status_file);
 }
@@ -1262,6 +1395,297 @@ static void auto_tick(void)
 	g_auto_reason = AR_PROBING;
 }
 
+/* ---------------------------------------------------------------- clock, OSD
+ *
+ * Is the clock a real one? The time service (time/run_time.sh) NTPs the box and
+ * publishes what it last confirmed; we read that file rather than trusting our
+ * own clock, because our own clock is exactly the thing in question. Both halves
+ * have to hold: the service has to say "synced", AND the epoch has to look like a
+ * date. A peer that answers with nonsense makes ntpd exit 0 too, and the vendor
+ * default (1970 plus uptime) would otherwise be drawn as a real date forever.
+ */
+static void clock_poll(void)
+{
+	FILE *f;
+	char line[128];
+	char peer[sizeof g_clock_peer];
+	int state = 0, saw_state = 0;
+	long last = 0, min_valid = 0;
+
+	f = fopen(g_time_status_file, "r");
+	if (!f) {
+		g_clock_state = -1;		/* nothing is keeping time here */
+		g_clock_last_sync = 0;
+		g_clock_peer[0] = 0;
+		g_clock_now = (long)time(NULL);
+		return;
+	}
+	peer[0] = 0;
+	while (fgets(line, sizeof line, f)) {
+		if (!strncmp(line, "state=", 6)) {
+			saw_state = 1;
+			state = !strncmp(line + 6, "synced", 6);
+		} else if (!strncmp(line, "last_sync=", 10)) {
+			last = atol(line + 10);
+		} else if (!strncmp(line, "min_valid=", 10)) {
+			min_valid = atol(line + 10);
+		} else if (!strncmp(line, "peer=", 5)) {
+			sscanf(line + 5, "%63s", peer);
+		}
+	}
+	fclose(f);
+
+	g_clock_now = (long)time(NULL);
+	g_clock_last_sync = last;
+	if (min_valid > 0)
+		g_clock_min_valid = min_valid;
+	if (peer[0])
+		snprintf(g_clock_peer, sizeof g_clock_peer, "%s", peer);
+	g_clock_state = (saw_state && state && g_clock_now >= g_clock_min_valid) ? 1 : 0;
+}
+
+/* The line that is going to be drawn. NO TIME rather than a wrong time: a wrong
+ * date in a recording is the one OSD fault that cannot be undone afterwards. */
+static void osd_text(char *out, size_t n)
+{
+	time_t now = (time_t)g_clock_now;
+	struct tm *tm;
+	size_t len;
+
+	if (g_clock_state != 1) {
+		snprintf(out, n, "NO TIME");
+		return;
+	}
+	tm = localtime(&now);
+	if (!tm || !strftime(out, n, g_osd_fmt, tm)) {
+		snprintf(out, n, "NO TIME");
+		return;
+	}
+	len = strlen(out);
+	while (len && out[len - 1] == ' ')
+		out[--len] = 0;
+	if (!len)
+		snprintf(out, n, "NO TIME");
+}
+
+static void osd_place(int max_w, int max_h, int w, int h, int *x, int *y)
+{
+	int m = g_osd_margin;
+
+	if (!strcmp(g_osd_pos, "tl")) {
+		*x = m;
+		*y = m;
+	} else if (!strcmp(g_osd_pos, "tr")) {
+		*x = max_w - w - m;
+		*y = m;
+	} else if (!strcmp(g_osd_pos, "br")) {
+		*x = max_w - w - m;
+		*y = max_h - h - m;
+	} else {
+		*x = m;
+		*y = max_h - h - m;
+	}
+	if (*x < 0)
+		*x = 0;
+	if (*y < 0)
+		*y = 0;
+}
+
+/*
+ * Bring the overlay up. The order is the SDK demo's order and it is not
+ * cosmetic: the font is chosen before ak_osd_init() because init sizes its
+ * buffers from it. The vendor's own boot log on this exact board shows the same
+ * sequence and geometry (ak_osd_set_font_file channel=1 font size=16, then
+ * ak_osd_init ch:0 fontS:32 res_w:1280 res_h:720, then ak_osd_set_rect xstart:0
+ * ystart:0 w:1280 h:64), which is also the proof that this path works on
+ * AK3918E + GC1084 and not only in the SDK.
+ *
+ * The rect is sized once, for the widest the format can produce, so a minute
+ * with a short text and a minute with a long one do not need it moved;
+ * ak_osd_draw_str() then draws inside it at 0,0.
+ */
+static int osd_open(void)
+{
+	int ch, chars, cell_w, cell_h, font_file_ok;
+
+	if (!g_vi) {
+		logmsg("osd: no capture handle yet, overlay off\n");
+		return -1;
+	}
+	font_file_ok = (access(g_osd_font_file, R_OK) == 0);
+	if (!font_file_ok) {
+		/*
+		 * There is no fallback here, and that is a property of this board, not
+		 * of the code: the ak_osd.h in the SDK dump declares ak_osd_set_font_size
+		 * for the "no font file" path, but the libmpi_osd.so this camera
+		 * generation actually ships does not export it (nor set_rect_enable, nor
+		 * set_edge_color - the linker is what said so, and nm -D on both copies
+		 * confirms it: the header belongs to a newer SDK generation than the
+		 * library). So the font bin is required. It is on this camera already:
+		 * /usr/local/ak_font_16.bin, 265798 bytes, from the vendor firmware.
+		 */
+		logmsg("osd: %s is not readable, and this build's libmpi_osd cannot "
+		       "select a builtin font size - overlay off (that is the vendor's "
+		       "own font file, so a missing one means the card changed)\n",
+		       g_osd_font_file);
+		return -1;
+	}
+	if (ak_osd_set_font_file(g_osd_size, g_osd_font_file)) {
+		logmsg("osd: ak_osd_set_font_file(%d, %s) failed\n",
+		       g_osd_size, g_osd_font_file);
+		return -1;
+	}
+	if (ak_osd_init(g_vi)) {
+		logmsg("osd: ak_osd_init failed - no overlay on this build\n");
+		return -1;
+	}
+	if (g_osd_color >= 0 || g_osd_bg >= 0)
+		ak_osd_set_color(g_osd_color < 0 ? 0 : g_osd_color,
+				 g_osd_bg < 0 ? 1 : g_osd_bg);
+	if (g_osd_alpha > 0)
+		ak_osd_set_alpha(g_osd_alpha);
+
+	/* Room for the format at its widest, not for the current text: a format
+	 * like "%d %b" is 8 characters one minute and 14 the next. */
+	osd_text(g_osd_text, sizeof g_osd_text);
+	chars = (int)strlen(g_osd_fmt) + 8;
+	if (chars < (int)strlen(g_osd_text))
+		chars = (int)strlen(g_osd_text);
+
+	for (ch = 0; ch < N_CH; ch++) {
+		int max_w = 0, max_h = 0, w, h, x = 0, y = 0;
+
+		if (!g_osd_ch[ch])
+			continue;
+		if (ak_osd_get_max_rect(ch, &max_w, &max_h) || max_w <= 0 || max_h <= 0) {
+			logmsg("osd: %s reports no drawable area; no overlay there\n",
+			       g_prof[ch].name);
+			g_osd_ch[ch] = 0;
+			continue;
+		}
+		cell_w = g_osd_size > 16 ? g_osd_size : 16;
+		/* The glyph advance comes from the font file, not from --osd-size:
+		 * this board's ak_font_16.bin draws 16 px wide whatever is handed to
+		 * ak_osd_set_font_file() - with --osd-size 8 and with --osd-size 32
+		 * the glyphs measured 16 px apart in the frame either way. Sizing the
+		 * rect from --osd-size clipped the date to "2026-11-19 1" at size 8,
+		 * so the width follows the real advance and --osd-size is left doing
+		 * the only thing this library lets it do: set the minimum rect
+		 * height, which is twice its value. */
+		/* Twice --osd-size: what the SDK demo does (FONT_HEIGHT * 2) and what
+		 * the vendor's own boot log does (font 32 in a 1280x64 rect). It is
+		 * also the floor this library enforces - a 400x32 rect at --osd-size
+		 * 32 was refused with "err ... h: 32, f: 64", f being twice the
+		 * size. The height matters more than that: the library stamps the
+		 * string once for every 16-row block of the rect (the font file's
+		 * real cell height), so a 32-tall rect shows the date twice, 16 px
+		 * apart, and a 16-tall rect - only reachable at --osd-size 8, since
+		 * the floor is twice the size - shows it once. Measured on 19 Nov;
+		 * --osd-rect-h exists to try other heights without a rebuild. */
+		cell_h = g_osd_rect_h > 0 ? g_osd_rect_h : g_osd_size * 2;
+		w = chars * cell_w;
+		h = cell_h;
+		if (w > max_w)
+			w = max_w;
+		if (h > max_h)
+			h = max_h;
+		osd_place(max_w, max_h, w, h, &x, &y);
+		/*
+		 * No ak_osd_set_rect_enable() here: the header declares it, this
+		 * board's library does not export it, and the SDK's own working example
+		 * does not call it either - set_rect is what turns an area on.
+		 */
+		if (osd_set_rect(g_vi, ch, x, y, w, h)) {
+			logmsg("osd: ak_osd_set_rect on %s failed (%dx%d at %d,%d of "
+			       "%dx%d)\n", g_prof[ch].name, w, h, x, y, max_w, max_h);
+			g_osd_ch[ch] = 0;
+			continue;
+		}
+		g_osd_w[ch] = w;
+		g_osd_h[ch] = h;
+		logmsg("osd: %s rect %dx%d at %d,%d of max %dx%d, font %s %dpx, pos %s\n",
+		       g_prof[ch].name, w, h, x, y, max_w, max_h,
+		       g_osd_font_file, g_osd_size, g_osd_pos);
+	}
+	if (!g_osd_ch[CH_MAIN] && !g_osd_ch[CH_SUB])
+		return -1;
+	g_osd_text[0] = 0;		/* force the first draw to paint */
+	return 0;
+}
+
+/*
+ * Paint the line. Called every second from the day/night thread, and forced
+ * after anything that can wipe the overlay (an ISP mode switch). Redrawing the
+ * same text is skipped: it is a copy into the overlay's pmem plus an ioctl,
+ * which is cheap, but "cheap" on this box is a claim that has to be measured,
+ * and nothing in the picture changes between minutes.
+ */
+static void osd_draw(int force)
+{
+	unsigned short wide[64];
+	char text[64];
+	int ch, i, len;
+
+	if (g_osd != 1)
+		return;
+	osd_text(text, sizeof text);
+	if (!force && g_osd_text[0] && !strcmp(text, g_osd_text))
+		return;
+	snprintf(g_osd_text, sizeof g_osd_text, "%s", text);
+	len = (int)strlen(text);
+	if (len > 63)
+		len = 63;
+	for (i = 0; i < len; i++)
+		wide[i] = (unsigned short)(unsigned char)text[i];
+
+	for (ch = 0; ch < N_CH; ch++) {
+		int xo = g_osd_xoff, yo = g_osd_yoff;
+		int row;
+
+		if (!g_osd_ch[ch])
+			continue;
+		/* The offsets are relative to the rect, and the library range-checks
+		 * them against the rect that channel was given. Clamping here means a
+		 * --osd-yoff that suits one channel and not the other degrades on the
+		 * odd channel instead of failing the overlay on both. */
+		if (yo > g_osd_h[ch] - g_osd_size)
+			yo = g_osd_h[ch] - g_osd_size;
+		if (yo < 0)
+			yo = 0;
+		if (xo > g_osd_w[ch] - g_osd_size)
+			xo = g_osd_w[ch] - g_osd_size;
+		if (xo < 0)
+			xo = 0;
+		/* Clear the whole canvas before painting. Nothing in this library
+		 * clears it by itself, and its clean call clears a slice, not the
+		 * rect: read out of the board's copy, the loop counter starts at the
+		 * SECOND argument and runs up to the stored font height, while the
+		 * third argument is the row the clearing starts at - so one call
+		 * covers roughly one line of the rect. Walking that start row across
+		 * the rect covers all of it. Without this the canvas keeps whatever
+		 * was in it: the previous minute's text, the previous geometry's text,
+		 * and - the DMA canvas comes back from the pool uninitialised -
+		 * whatever the previous process left. All of it gets burned into the
+		 * NVR's recording next to the current date, which is what the two
+		 * bands in the picture actually were: two different strings, at two
+		 * different offsets, one of them left over from an earlier run. */
+		for (row = 0; row < g_osd_h[ch]; row += g_osd_size) {
+			if (osd_clean_str(ch, 0, row, 0, 0) &&
+			    !g_osd_clean_warned[ch]) {
+				logmsg("osd: ak_osd_clean_str on %s failed at row %d; "
+				       "the overlay piles up instead of being redrawn\n",
+				       g_prof[ch].name, row);
+				g_osd_clean_warned[ch] = 1;
+			}
+		}
+		if (osd_draw_str(ch, xo, yo, wide, len)) {
+			logmsg("osd: ak_osd_draw_str on %s failed; overlay off there\n",
+			       g_prof[ch].name);
+			g_osd_ch[ch] = 0;
+		}
+	}
+}
+
 /*
  * The day/night thread. It now always runs (unless --mode-file "" is given),
  * because its job is no longer only deciding: it applies what the control file
@@ -1281,6 +1705,7 @@ static void *light_watch(void *unused)
 {
 	char word[32];
 	int tick = 0, want = -1, ldr = -1;
+	int last_mode = -2;		/* to notice a switch that can wipe the OSD */
 
 	(void)unused;
 	g_have_ir = (ak_drv_ir_init() == 0);
@@ -1304,6 +1729,10 @@ static void *light_watch(void *unused)
 		g_filter_pos = node_read(g_ircut_node);
 		if (g_vi)
 			g_ae_ok = (ak_vpss_isp_get_ae_run_info(g_vi, &g_ae) == 0);
+		/* Read what the clock supervisor last confirmed before anything that
+		 * prints a date is consulted. One small file per second: this box
+		 * cannot afford /proc walks, but it can afford this. */
+		clock_poll();
 
 		if (want == 0 || want == 1) {
 			/* Manual beats everything, and the auto machine is re-anchored on
@@ -1333,6 +1762,22 @@ static void *light_watch(void *unused)
 			logmsg("day/night: ldr says %d (--auto-night; this board's light "
 			       "sensor does not respond)\n", ldr);
 			apply_mode(ldr, "light sensor");
+		}
+
+		/*
+		 * The overlay is painted from here rather than from a thread of its
+		 * own: it is one more thing that has to agree with the clock, and the
+		 * loop already runs every second. A change of mode forces a redraw
+		 * even when the text has not changed, because switching the ISP mode
+		 * rebuilds what the encoder is fed; that this should ever drop the
+		 * overlay has not been measured, and the forced redraw costs one call
+		 * per switch, so the precaution stays and is labelled as one.
+		 */
+		if (g_osd == 1 && g_mode != last_mode) {
+			last_mode = g_mode;
+			osd_draw(1);
+		} else {
+			osd_draw(0);
 		}
 
 		/* Status every 2 s: fresh enough for the page, and the file is rewritten
@@ -1782,6 +2227,13 @@ static void usage(const char *argv0)
 		"         [--auto-dwell-secs 45] [--auto-rearm-secs 300]\n"
 		"         [--no-auto-lamp] [--no-auto-filter] [--ir-led-node PATH]\n"
 		"         [--ptz-fifo /tmp/ptz.daemon] [--ircut-node PATH]\n"
+		"         [--osd-time] [--osd-pos tl|tr|bl|br] [--osd-size 16]\n"
+		"         [--osd-rect-h 32] [--osd-xoff 0] [--osd-yoff 0]\n"
+		"         [--osd-fmt \"%%Y-%%m-%%d %%H:%%M:%%S\"]\n"
+		"         [--osd-no-sub]\n"
+		"         [--osd-font /usr/local/ak_font_16.bin] [--osd-color N]\n"
+		"         [--osd-bg N] [--osd-alpha 1..100]\n"
+		"         [--time-status /tmp/camweb_time.status]\n"
 		"\n"
 		"gop is clamped to at least fps: libakstreamenc dies with SIGFPE at the\n"
 		"second keyframe when the GOP is shorter than a second.\n"
@@ -1817,7 +2269,20 @@ static void usage(const char *argv0)
 		"sensor fps that our fixed-step RTP timestamps do not yet follow.\n"
 		"The status file is rewritten every 2 s for the web UI: current and requested\n"
 		"mode, the ae readings, what auto decided and why, fps, clients and the\n"
-		"frame counters.\n", argv0);
+		"frame counters.\n"
+		"\n"
+		"--osd-time burns the clock into the picture, on both channels, through the\n"
+		"ISP's own overlay (ak_osd): the text is in the pixels before the encoder\n"
+		"runs, so the NVR's recordings carry it and it costs the core nothing. It\n"
+		"refuses to draw a date it cannot vouch for: the clock's state comes from\n"
+		"--time-status, written by /mnt/camweb/time/run_time.sh, and unless that\n"
+		"says synced and the epoch looks like a date the overlay reads NO TIME - a\n"
+		"wrong date in a recording cannot be taken back out afterwards. This board\n"
+		"has no rtc at all, so on a box that has never synced, NO TIME is the true\n"
+		"answer and not a fault. This library gives each video channel one rect and\n"
+		"draws the string inside it, in the 16px font at /usr/local/ak_font_16.bin -\n"
+		"the same font and the same overlay path the vendor's own boot log uses on\n"
+		"this board.\n", argv0);
 }
 
 static int parse_size(const char *s, int *w, int *h)
@@ -1832,7 +2297,7 @@ int main(int argc, char **argv)
 	pthread_t prod_th[N_CH];
 	pthread_t light_th;
 	int light_on = 0;
-	int listen_fd, ch, i, c;
+	int listen_fd, ch, i, c, ignored = 0;
 	struct sockaddr_in sa;
 	static const struct option longopts[] = {
 		{ "port", 1, 0, 'p' }, { "fps", 1, 0, 'F' }, { "gop", 1, 0, 'G' },
@@ -1849,6 +2314,14 @@ int main(int argc, char **argv)
 		{ "ircut-node", 1, 0, 'C' },
 		{ "auto-fps", 0, 0, 'a' },
 		{ "mode-file", 1, 0, 'm' }, { "status-file", 1, 0, 's' },
+		{ "osd-time", 0, 0, 'O' }, { "osd-pos", 1, 0, 'o' },
+		{ "osd-size", 1, 0, 'Z' }, { "osd-rect-h", 1, 0, 't' },
+		{ "osd-xoff", 1, 0, 'X' }, { "osd-yoff", 1, 0, 'Y' },
+		{ "osd-font", 1, 0, 'J' },
+		{ "osd-fmt", 1, 0, 'T' }, { "osd-no-sub", 0, 0, 'Q' },
+		{ "osd-color", 1, 0, 'W' }, { "osd-bg", 1, 0, 'B' },
+		{ "osd-alpha", 1, 0, 'H' },
+		{ "time-status", 1, 0, 'K' },
 		{ "verbose", 0, 0, 'v' }, { "help", 0, 0, 'h' }, { 0, 0, 0, 0 }
 	};
 
@@ -1860,7 +2333,7 @@ int main(int argc, char **argv)
 	g_prof[CH_SUB].h = 480;
 
 	while ((c = getopt_long(argc, argv,
-			"p:F:G:M:S:b:k:n:aNAfm:s:D:L:d:l:P:e:w:R:x:y:I:u:C:vh",
+			"p:F:G:M:S:b:k:n:aNAfm:s:D:L:d:l:P:e:w:R:x:y:I:u:C:Oo:Z:t:X:Y:J:T:QW:B:H:K:vh",
 			longopts, NULL)) != -1) {
 		switch (c) {
 		case 'p': port = atoi(optarg); break;
@@ -1907,10 +2380,92 @@ int main(int argc, char **argv)
 			else
 				usage(argv[0]), exit(2);
 			break;
+		case 'O': g_osd = 1; break;
+		case 'o':
+			if (strcmp(optarg, "tl") && strcmp(optarg, "tr") &&
+			    strcmp(optarg, "bl") && strcmp(optarg, "br")) {
+				fprintf(stderr, "--osd-pos must be tl, tr, bl or br\n");
+				usage(argv[0]);
+				return 2;
+			}
+			snprintf(g_osd_pos, sizeof g_osd_pos, "%s", optarg);
+			break;
+		case 'Z':
+			g_osd_size = atoi(optarg);
+			if (g_osd_size < 8 || g_osd_size > 64)
+				die("--osd-size must be 8..64 px (the font this "
+				    "board ships is 16)\n");
+			break;
+		case 't':
+			g_osd_rect_h = atoi(optarg);
+			if (g_osd_rect_h < 8 || g_osd_rect_h > 128)
+				die("--osd-rect-h must be 8..128 px\n");
+			break;
+		case 'X':
+			g_osd_xoff = atoi(optarg);
+			if (g_osd_xoff < 0 || g_osd_xoff > 128)
+				die("--osd-xoff must be 0..128 px\n");
+			break;
+		case 'Y':
+			g_osd_yoff = atoi(optarg);
+			if (g_osd_yoff < 0 || g_osd_yoff > 128)
+				die("--osd-yoff must be 0..128 px\n");
+			break;
+		case 'J':
+			snprintf(g_osd_font_file, sizeof g_osd_font_file, "%s", optarg);
+			break;
+		case 'T':
+			snprintf(g_osd_fmt, sizeof g_osd_fmt, "%s", optarg);
+			break;
+		case 'Q': g_osd_ch[CH_SUB] = 0; break;
+		case 'W': case 'B': {
+			int v = atoi(optarg);
+
+			/* 0..15 because that is the size of the library's colour
+			 * table, not an arbitrary limit: an id out of it reads
+			 * whatever is past the end of the array. There is no
+			 * --osd-edge on purpose - ak_osd_set_edge_color is declared
+			 * in the header and not exported by this board's libmpi_osd,
+			 * so offering it would be offering a flag that does nothing. */
+			if (v < 0 || v > 15)
+				die("--osd-color/--osd-bg take a colour id 0..15\n");
+			if (c == 'W')
+				g_osd_color = v;
+			else
+				g_osd_bg = v;
+			break;
+		}
+		case 'H':
+			g_osd_alpha = atoi(optarg);
+			if (g_osd_alpha < 1 || g_osd_alpha > 100)
+				die("--osd-alpha must be 1..100\n");
+			break;
+		case 'K':
+			snprintf(g_time_status_file, sizeof g_time_status_file, "%s", optarg);
+			break;
 		case 'v': g_verbose = 1; break;
-		default: usage(argv[0]); return 2;
+		case 'h': usage(argv[0]); return 0;
+		case '?':
+		default:
+			/*
+			 * An option this build has never heard of is a complaint, not a
+			 * reason to stop serving. The argument line lives in
+			 * /mnt/camweb/akrtsp.args and is read at every start, so a line
+			 * written for a newer binary than the one on the card is version
+			 * skew waiting to happen - and it happened: one word the deployed
+			 * build did not know made this process print its usage and exit,
+			 * the supervisor counted three failed starts and handed :554 to the
+			 * vendor server, so an overlay flag cost the camera its whole
+			 * pipeline. getopt has already named the word and skipped it; count
+			 * what was skipped and let the log say so.
+			 */
+			ignored++;
+			continue;
 		}
 	}
+	if (ignored)
+		printf("args: %d option(s) this build does not know, ignored - "
+		       "check /mnt/camweb/akrtsp.args against --help\n", ignored);
 	if (fps < 1 || fps > 30)
 		die("fps must be 1..30 (sensor reports 1280x720; the ISP conf runs 15)\n");
 	if (gop < fps) {
@@ -1971,6 +2526,22 @@ int main(int argc, char **argv)
 		die("listen: %s\n", strerror(errno));
 
 	pipeline_open();
+	/*
+	 * The overlay has to exist before the first frames are served, and it has
+	 * to know whether the clock is real before it sizes itself, so the clock
+	 * state is read once here and then every second in the day/night thread.
+	 * An overlay that cannot come up is a broken feature, not a reason not to
+	 * stream: say so in the log and the status file and carry on.
+	 */
+	clock_poll();
+	if (g_osd == 1) {
+		if (osd_open() != 0)
+			g_osd = -1;
+		else
+			osd_draw(1);
+	} else {
+		printf("osd: overlay off (--osd-time burns the clock in)\n");
+	}
 	for (ch = 0; ch < N_CH; ch++) {
 		if (pthread_create(&prod_th[ch], NULL, producer, &g_prof[ch]) != 0)
 			die("pthread_create producer %s\n", g_prof[ch].name);
@@ -2059,6 +2630,13 @@ int main(int argc, char **argv)
 		pthread_join(prod_th[ch], NULL);
 	if (light_on)
 		pthread_join(light_th, NULL);	/* polls in 1 s slices, so this waits at most a second */
+	/*
+	 * The overlay owns pmem and is registered against the vi handle, so it
+	 * goes away between the last drawer stopping and the device closing: after
+	 * ak_vi_close() there is nothing left for it to talk to.
+	 */
+	if (g_osd == 1)
+		ak_osd_destroy();
 	for (i = 0; i < MAX_SESS; i++)
 		if (g_sess[i].used)
 			sess_free(&g_sess[i]);

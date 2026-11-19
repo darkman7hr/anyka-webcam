@@ -27,12 +27,19 @@ def grab(url, out):
     # like "the image went dark". Wait for a real key frame instead, and allow a
     # couple of seconds for one to arrive (GOP here is 1 s).
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-rtsp_transport", "tcp",
-           "-i", url, "-t", "6",
+           "-i", url, "-t", "10",
            "-vf", "select=eq(pict_type\\,I)", "-fps_mode", "vfr",
            "-frames:v", "1", "-f", "image2", "-c:v", "ppm", "-y", out]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     if r.returncode:
         print("ffmpeg failed: %s" % (r.stderr.strip().splitlines()[-1] if r.stderr.strip() else r.returncode))
+        return None
+    # A zero exit is not a frame. When the select filter never matched, ffmpeg
+    # writes nothing and still reports success: that is what happens on a stream
+    # that has just been restarted and has not emitted a key frame yet. Callers
+    # that then open the file find out in the wrong place, several steps later.
+    if not os.path.exists(out) or os.path.getsize(out) < 1024:
+        print("no frame from %s: no key frame arrived inside the window" % url)
         return None
     return out
 

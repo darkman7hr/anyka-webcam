@@ -42,6 +42,14 @@ LIBS       := -lmpi_venc -lakstreamenc -lplat_vi -lplat_vpss -lplat_common \
 # The server needs it from the moment it switches day/night itself instead of
 # leaving the ISP in whatever mode the conf file booted into.
 LIBS       += -lplat_drv
+# -lmpi_osd for the stream server only: that is what burns the clock into the
+# picture. Per-target rather than in LIBS because these are shared libraries and
+# an unused -l still lands in the binary's NEEDED list, which would leave the
+# probes requiring a library they never call - and on this board a missing .so
+# means the program does not start at all. libmpi_osd.so is not in the vendor's
+# /mnt/Factory/custom/lib; it comes from the same rootfs_v1basic tree as the
+# other libraries here and is deployed to /mnt/camrtsp/lib.
+OSD_LIBS   := -lmpi_osd
 
 CAM_HOST  ?= 192.168.10.46
 
@@ -65,7 +73,7 @@ irprobe: akir_probe.c
 	@ls -l akir_probe.stripped
 
 akrtsp: akrtsp.c vi_abi.h
-	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS) $(LIBS)
+	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS) $(LIBS) $(OSD_LIBS)
 
 check: akstream akrtsp
 	$(TOOLCHAIN)/usr/bin/arm-anykav200-linux-uclibcgnueabi-readelf -d akrtsp | grep NEEDED

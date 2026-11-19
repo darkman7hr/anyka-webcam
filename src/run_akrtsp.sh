@@ -24,7 +24,15 @@
 # Processes are matched by /proc/<pid>/comm, never by grepping ps - see the notes
 # in run_takeover.sh (the vendor binary is /mnt/Factory/custom/rtsp or ./rtsp, and
 # a word grep matches this script's own argv).
-export LD_LIBRARY_PATH=/mnt/Factory/custom/lib
+# libmpi_osd.so - the ISP overlay that burns the clock into the picture - is not
+# in the vendor's lib directory. It comes from the same rootfs_v1basic tree as the
+# other libraries this build links against and is deployed to /mnt/camrtsp/lib, so
+# ours is searched first and /mnt/Factory stays untouched. Worth knowing what
+# happens if that file is ever missing: the loader refuses to start akrtsp at all,
+# the supervisor counts it as a failed start and falls back to the vendor server -
+# a camera recording without a clock overlay beats one that records nothing.
+LD_LIBRARY_PATH="/mnt/camrtsp/lib:/mnt/Factory/custom/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH
 
 # Started by /mnt/Factory/config.sh at boot, where it inherits the boot
 # environment rather than an interactive shell's. Without this the loop can be
@@ -48,7 +56,33 @@ fi
 LOG=${LOG:-/tmp/akrtsp.log}
 SUP=${SUP:-/tmp/akrtsp_sup.log}
 PIDF=${PIDF:-/tmp/akrtsp_sup.pid}
-AK_ARGS=${AK_ARGS:---mode-file /mnt/camweb/daynight.conf --force-night night --ir-follow}
+# The clock that gets burned into the picture is printed in the zone named by the
+# same conf the clock supervisor reads, so there is exactly one place that says
+# what zone this camera is in. It has to be a POSIX rule (CET-1CEST,M3.5.0,
+# M10.5.0/3) because uClibc here carries no zoneinfo database. It overrides the
+# vendor's TZ=GMT-08:00 on purpose: that is the vendor's own "timezone:8", not this
+# network's.
+TIME_CONF=${TIME_CONF:-/mnt/camweb/time/time.conf}
+if [ -f "$TIME_CONF" ]; then
+	. "$TIME_CONF"
+	[ -n "$TZ_STR" ] && TZ="$TZ_STR" && export TZ
+fi
+# The arguments. A file on the card wins over the environment, because the file is
+# what the tools change and what survives a reboot: editing the AK_ARGS in
+# config.sh means restarting the supervisor to pick it up, and the supervisor is
+# the thing that holds :554. The environment still works when there is no file,
+# which is what keeps a bench run (`AK_ARGS="--port 8554 ..." sh run_akrtsp.sh`)
+# possible; ARGS_FILE moves the file, so a bench run can use its own.
+# Whatever wins, the round says which file it came from: two places that can hold
+# the arguments is a trap unless the log names the one that was used.
+ARGS_FILE=${ARGS_FILE:-/mnt/camweb/akrtsp.args}
+if [ -r "$ARGS_FILE" ]; then
+	AK_ARGS=$(cat "$ARGS_FILE" 2>/dev/null)
+	ARGS_SRC=$ARGS_FILE
+else
+	ARGS_SRC=environment
+fi
+AK_ARGS=${AK_ARGS:---mode-file /mnt/camweb/daynight.conf --force-night night --ir-follow --osd-time --osd-pos br}
 
 pids_by_comm()
 {
@@ -56,7 +90,13 @@ pids_by_comm()
 	# process, ~100 forks per round, and this loop runs every round.
 	for p in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
 		[ -r "/proc/$p/comm" ] || continue
-		read -r c < "/proc/$p/comm"
+		# 2>/dev/null because the test and the read are not one step: a process
+		# that dies in between would otherwise print into the supervisor's log
+		# every round, and a log full of noise hides the line that matters. The
+		# 2>/dev/null goes before the input redirect because ash applies
+		# redirections left to right: "read c < f 2>/dev/null" still reports the
+		# failed <f on the shell's stderr (measured on this board).
+		read -r c 2>/dev/null < "/proc/$p/comm" || continue
 		[ "$c" = "$1" ] && echo "$p"
 	done
 }
@@ -82,7 +122,32 @@ if [ -f "$PIDF" ]; then
 fi
 echo $$ > "$PIDF"
 
-say "supervisor up: interval=${INTERVAL}s maxfails=${MAXFAILS} args='$AK_ARGS' bin=$(md5sum $BIN 2>/dev/null | cut -c1-8)"
+say "supervisor up: interval=${INTERVAL}s maxfails=${MAXFAILS} args='$AK_ARGS' args_from=$ARGS_SRC bin=$(md5sum $BIN 2>/dev/null | cut -c1-8)"
+
+# The clock, once, before anything starts counting frames against it.
+#
+# akrtsp's RTP timestamps count frames at 90000/fps and only creep FORWARD
+# against the wall clock, so a step under a running stream - tens of seconds, or
+# the 56 years that the first sync of every boot is on a board with no rtc - is a
+# hole every client has to decode around. Taking the step here, where nothing is
+# streaming yet, is what keeps it out of the recording.
+#
+# Bounded and never fatal: 30 s, and only when the clock service is installed at
+# all. A camera that cannot reach an NTP peer still has to stream; what it loses
+# is the date, which akrtsp prints as NO TIME rather than as a wrong one.
+if [ -r /mnt/camweb/time/run_time.sh ]; then
+	i=0
+	while [ ! -r /tmp/camweb_time.status ] && [ $i -lt 30 ]; do
+		sleep 1
+		i=$((i+1))
+	done
+	if [ -r /tmp/camweb_time.status ]; then
+		say "clock: $(grep -h '^state=' /tmp/camweb_time.status 2>/dev/null) " \
+			"$(grep -h '^peer=' /tmp/camweb_time.status 2>/dev/null) after ${i}s"
+	else
+		say "clock: nothing written by /mnt/camweb/time after 30 s; starting anyway"
+	fi
+fi
 
 while :; do
 	AP=$(pids_by_comm akrtsp)
@@ -150,6 +215,10 @@ while :; do
 
 	fails=$((fails + 1))
 	say "nothing on :554; starting akrtsp (attempt $fails/$MAXFAILS)"
+	# Where the log ended before this start, so the reason for a failed start can
+	# be quoted from it below. Line count rather than byte count because busybox
+	# tail is not guaranteed to understand "-c +N", but "-n +N" is everywhere.
+	MARK=$(wc -l < "$LOG" 2>/dev/null || echo 0)
 	setsid "$BIN" --port 554 --verbose $AK_ARGS >> "$LOG" 2>&1 &
 	sleep 6
 	# Success means the process this script started is alive AND the port is up.
@@ -162,6 +231,12 @@ while :; do
 	fi
 
 	say "akrtsp failed to bind :554"
+	# Quote what the child actually said. The supervisor can only see "no process,
+	# no port"; the reason (an argument this build does not know, a bind error, a
+	# vendor library that refused the pipeline) is in the log the child just wrote,
+	# and it was the one thing missing when three starts failed over a flag name.
+	tail -n +$((MARK + 1)) "$LOG" 2>/dev/null | tail -4 |
+		while IFS= read -r line; do say "  child: $line"; done
 	for p in $(pids_by_comm akrtsp); do kill -9 "$p" 2>/dev/null; done
 	sleep 2
 	if [ "$fails" -ge "$MAXFAILS" ]; then

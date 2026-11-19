@@ -18,7 +18,13 @@
 # This does NOT survive a reboot: config.sh still starts /mnt/Factory/custom/rtsp.
 # Making the change permanent means editing config.sh, which is a separate
 # decision - do it only after akrtsp has run against the real NVR for a while.
-export LD_LIBRARY_PATH=/mnt/Factory/custom/lib
+# Ours first, then the vendor's - the same order run_akrtsp.sh uses, and for the
+# same reason: since the clock overlay was added, akrtsp needs libmpi_osd.so, and
+# that lives in /mnt/camrtsp/lib, not in the vendor's directory. Measured, the
+# rehearsal here failed with "can't load library 'libmpi_osd.so'" while this line
+# still named only /mnt/Factory/custom/lib - a handover that cannot even start the
+# binary is worse than no handover, because it stops the vendor server on the way.
+export LD_LIBRARY_PATH=/mnt/camrtsp/lib:/mnt/Factory/custom/lib
 
 # Extra flags for akrtsp. The default is deliberate, not incidental: this camera
 # sits in a dark room lit by its own IR illuminator, and the ISP boots in DAY mode,
@@ -31,6 +37,19 @@ export LD_LIBRARY_PATH=/mnt/Factory/custom/lib
 # inserts the IR-cut filter and blinds the camera. See README, "The purple image".
 AK_ARGS=${AK_ARGS:---mode-file /mnt/camweb/daynight.conf --force-night night}
 
+# The zone the burned-in clock is printed in, sourced from the same conf the clock
+# supervisor and run_akrtsp.sh read. This was missing, and the symptom was not a
+# crash: a handover started akrtsp under the login shell's TZ, which the vendor
+# sets to GMT-08:00, so the overlay drew 22:18 when the wall said 15:18 - a date
+# seven hours wrong, burned into every frame the NVR recorded off it. Anything that
+# starts akrtsp has to set the zone itself, because uClibc here carries no zoneinfo
+# database and the process inherits whatever the starting shell happened to have.
+TIME_CONF=${TIME_CONF:-/mnt/camweb/time/time.conf}
+if [ -f "$TIME_CONF" ]; then
+	. "$TIME_CONF"
+	[ -n "$TZ_STR" ] && TZ="$TZ_STR" && export TZ
+fi
+
 # Match processes by /proc/<pid>/comm, never by grepping ps: the vendor binary
 # runs as /mnt/Factory/custom/rtsp from the init scripts but as "./rtsp" when
 # restarted by hand, and a path grep silently matches nothing - leaving it holding
@@ -40,8 +59,15 @@ pids_by_comm()
 	# `read' is a builtin: `$(cat /proc/$p/comm)' forks once per process, and
 	# these loops run in poll cycles on a single-core box.
 	for p in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+		# The test and the read are not one atomic step: a helper that dies in
+		# between made this print "can't open /proc/15270/comm: no such file" in
+		# the middle of a handover, which reads like a fault in the handover
+		# rather than some unrelated process going away. The 2>/dev/null has to
+		# come BEFORE the input redirect: ash applies redirections left to right,
+		# so "read c < f 2>/dev/null" still reports the failed <f on the shell's
+		# stderr (measured on this board: that order prints it, this one does not).
 		[ -r "/proc/$p/comm" ] || continue
-		read -r c < "/proc/$p/comm"
+		read -r c 2>/dev/null < "/proc/$p/comm" || continue
 		[ "$c" = "$1" ] && echo "$p"
 	done
 }
