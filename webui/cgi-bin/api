@@ -74,12 +74,17 @@ jhdr() {
   # URLs (act=presets especially). A browser free to cache that response shows a
   # stale preset list: the save really happens on the card, the screen never
   # changes, and it looks exactly like "saving does not work".
-  echo "Content-type: application/json"
-  echo "Cache-Control: no-store, no-cache, must-revalidate"
-  echo "Pragma: no-cache"
-  echo "Expires: 0"
-  echo "Connection: close"
-  echo
+  # CRLF on every line, not just the status line busybox httpd writes itself:
+  # echo emits a bare LF, and a header block that mixes LF with CRLF is not valid
+  # HTTP. Browsers and curl forgive it, Node's parser does not ("Missing expected
+  # CR after header value"), so the API was unreadable from any strict client -
+  # including the checks in tools/, which then looked like a broken camera.
+  printf 'Content-type: application/json\r\n'
+  printf 'Cache-Control: no-store, no-cache, must-revalidate\r\n'
+  printf 'Pragma: no-cache\r\n'
+  printf 'Expires: 0\r\n'
+  printf 'Connection: close\r\n'
+  printf '\r\n'
 }
 esc()  { printf '%s' "$1" | sed -e 's/[&<>"\\]/ /g' -e 's/^ *//' -e 's/ *$//'; }
 
@@ -602,7 +607,7 @@ case "$act" in
     # endpoint. run_live.sh holds an atomic lock, so a second concurrent start
     # here cannot produce a second supervisor.
     if [ ! -x "$LIVE/go2rtc" ]; then echo '{"ok":0,"err":"relay not installed - run tools/live.py --install"}'; exit 0; fi
-    if [ -f "$LIVE/disable" ]; then echo '{"ok":0,"err":"relay disabled on the camera (rm /mnt/camweb/live/disable)"}'; exit 0; fi
+    if [ -f "$LIVE/disable" ]; then echo '{"ok":0,"err":"relay blocked on this camera - the \"Relay: blocked\" button on the Camera card allows it again"}'; exit 0; fi
     if [ "${LIVE_EN:-1}" != "1" ]; then echo '{"ok":0,"err":"relay disabled (LIVE_EN=0 in live.conf)"}'; exit 0; fi
     live_seen
     started=0
@@ -633,18 +638,42 @@ case "$act" in
     ;;
 
   live_stop)
-    /bin/sh $LIVE/stop_live.sh >/dev/null 2>&1
+    # The decision and the reply come FIRST, the teardown goes to the background.
+    # stop_live.sh waits up to ~6 s for the supervisor and go2rtc to exit, and
+    # this httpd serves one connection at a time: held that long it starves the
+    # page's own status polls, which then land out of order behind the reply and
+    # write the switch back to the state the click had just changed. A 3 s switch
+    # on a one-core box is not a slow button, it is a race the page loses.
+    printf 'stopped\n' > $LSTATE 2>/dev/null
     live_json "\"stopped\":1,"
+    /bin/sh $LIVE/stop_live.sh >/dev/null 2>&1 &
     ;;
 
   live_off)
-    /bin/sh $LIVE/stop_live.sh --disable >/dev/null 2>&1
-    live_json ""
+    # Persistent block. Flag first so this reply reports the truth, teardown
+    # after - see live_stop for why the order is load-bearing.
+    touch $LIVE/disable 2>/dev/null
+    if [ ! -f "$LIVE/disable" ]; then
+      echo '{"ok":0,"err":"the card refused to create /mnt/camweb/live/disable - read-only or full"}'
+      exit 0
+    fi
+    printf 'disable\n' > $LSTATE 2>/dev/null
+    live_json "\"blocked\":1,"
+    /bin/sh $LIVE/stop_live.sh --disable >/dev/null 2>&1 &
     ;;
 
   live_on)
-    /bin/sh $LIVE/stop_live.sh --enable >/dev/null 2>&1
-    live_json ""
+    rm -f $LIVE/disable 2>/dev/null
+    # Read the removal back rather than trusting it: a card that will not let go
+    # of the file must not be reported as "allowed", because the page would then
+    # show a switch the Live button contradicts a second later.
+    if [ -f "$LIVE/disable" ]; then
+      echo '{"ok":0,"err":"could not remove /mnt/camweb/live/disable - the card refused the write"}'
+      exit 0
+    fi
+    printf 'enable\n' > $LSTATE 2>/dev/null
+    live_json "\"blocked\":0,"
+    /bin/sh $LIVE/stop_live.sh --enable >/dev/null 2>&1 &
     ;;
 
   reboot)

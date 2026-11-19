@@ -8,6 +8,16 @@ var presets = [], tour = null, tourIx = -1;
 var FOV = parseFloat(localStorage.getItem("camfov") || "62");
 
 function $(id) { return document.getElementById(id); }
+
+/* Text for a card line that might not be there. This is not defensive padding:
+   one line of poll() referenced $("rtspalt"), an id that no longer exists in
+   index.html, and the assignment threw inside the .then - so every line AFTER it
+   in the same .then stopped running, on every single poll, forever. That was the
+   header (already painted) looking perfectly healthy while the Live relay line,
+   the relay links and the relay switch never updated again, and it is why the
+   relay switch could not be seen to be wrong from the page: the page never asked
+   the camera about it. A missing element now costs its own line and nothing else. */
+function $set(id, text) { var e = $(id); if (e) e.textContent = text; }
 function esc(s) {
   return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) {
     return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
@@ -81,27 +91,45 @@ function renderPos() {
 }
 
 function poll() {
+  var ep = lv.epoch;          /* the epoch this reply must match to speak for the relay switch */
   api({ act: "status" }).then(function (j) {
     if (!j || !j.ok) return;
-    st.pan = j.pan; st.tilt = j.tilt;
-    st.pmin = j.pan_min; st.pmax = j.pan_max; st.tmin = j.tilt_min; st.tmax = j.tilt_max;
-    if (j.step) st.step = j.step;
-    if (String(st.preview) !== String(j.preview_url || "")) { st.preview = j.preview_url || ""; setupPreview(); }
-    renderPos();
-    $("live").className = "dot on";
-    $("ip").textContent = j.ip || location.hostname;
-    $("uptime").textContent = "up " + fmtUp(j.uptime || 0);
-    $("load").textContent = "load " + j.load;
-    $("mem").textContent = j.mem_free + " MB free of " + j.mem_total + " MB";
-    $("wifi").textContent = (j.link || "--").replace("|", " dB  /  ") + " dBm";
-    $("kern").textContent = "Linux " + (j.fw || "");
-    var host = j.ip || location.hostname;
-    $("rt1").textContent = "rtsp://" + host + ":554/vs0";
-    $("rt2").textContent = "rtsp://" + host + ":554/vs1";
-    renderNight(j);
-    $("rtspalt").textContent = "rtsp://" + host + ":554/vs0";
-    if (typeof j.live_port !== "undefined") lvPollStatus(j);
+    /* Drawing is wrapped, because the catch below cannot tell "the camera did not
+       answer" apart from "this page threw while drawing" - and it treated both as
+       a grey dot. The dead $("rtspalt") reference lived in exactly that blind
+       spot: it threw on every poll and the page showed a healthy header plus a
+       relay card that had frozen. */
+    try {
+      renderStatus(j, ep);
+    } catch (e) {
+      msg("page could not draw part of the status: " + ((e && e.message) ? e.message : e), true);
+    }
   }).catch(function () { $("live").className = "dot"; });
+}
+
+/* Everything the 3 s status reply is allowed to change on screen. Split out of
+   poll() so the try/catch above stays one line deep and nothing hides inside it. */
+function renderStatus(j, ep) {
+  st.pan = j.pan; st.tilt = j.tilt;
+  st.pmin = j.pan_min; st.pmax = j.pan_max; st.tmin = j.tilt_min; st.tmax = j.tilt_max;
+  if (j.step) st.step = j.step;
+  if (String(st.preview) !== String(j.preview_url || "")) { st.preview = j.preview_url || ""; setupPreview(); }
+  renderPos();
+  $("live").className = "dot on";
+  $set("ip", j.ip || location.hostname);
+  $set("uptime", "up " + fmtUp(j.uptime || 0));
+  $set("load", "load " + j.load);
+  $set("mem", j.mem_free + " MB free of " + j.mem_total + " MB");
+  $set("wifi", (j.link || "--").replace("|", " dB  /  ") + " dBm");
+  $set("kern", "Linux " + (j.fw || ""));
+  var host = j.ip || location.hostname;
+  $set("rt1", "rtsp://" + host + ":554/vs0");
+  $set("rt2", "rtsp://" + host + ":554/vs1");
+  renderNight(j);
+  /* There used to be a third RTSP line here, written to $("rtspalt"). That id
+     is not in index.html, so this assignment threw and took the relay update
+     below it down with it, on every poll, indefinitely. */
+  if (typeof j.live_port !== "undefined") lvPollStatus(j, ep);
 }
 
 /* ---------- recorded positions ----------
@@ -356,7 +384,14 @@ function tickPv() {
 var lv = { want: false, playing: false, abort: null, ms: null, sb: null, url: "",
            timer: null, tries: 0, port: 1984, codec: "", idle: 300,
            busy: false, gen: 0, hlsid: "", joined: false,
-           pc: null, mode: "" };
+           pc: null, mode: "",
+           /* The relay switch. lv.off is what the camera last told us; lv.epoch
+              says which replies may still speak for it; lv.mutating is set while
+              a click's request is in the air; lv.last is the last complete relay
+              object we were given, so a failed click can still repaint the truth.
+              The switch used to be read back out of the button's own label - see
+              lvInfo for what that cost. */
+           off: false, epoch: 0, mutating: false };
 
 
 
@@ -370,51 +405,116 @@ function lvChip(t, cls) {
   c.style.color = cls === "bad" ? "var(--bad)" : (cls === "ok" ? "var(--ok)" : "");
 }
 
-/* Feed the Camera card from any live_* reply: they all answer the same object. */
-function lvInfo(j) {
+/* Feed the Camera card from any live_* reply: they all answer the same object.
+   <auth> means "this reply is the newest word on the switch". It is true for the
+   answer to a click and false for the periodic ones.
+
+   That distinction is the whole point. The switch is a file on the card, so the
+   page must follow the camera and not its own last click - but a status poll that
+   left the page BEFORE a click can land AFTER that click's own reply and print
+   the old word back over it. The page used to read the switch's state out of the
+   button's label and decide what to send from that, so one such stale reply was
+   enough to make the button stuck: every later click then asked for the state the
+   camera was already in, and nothing ever came back. The CGI made the window
+   wider still by holding the camera's one-connection web server for about 3 s
+   while it stopped the relay, which guaranteed polls in flight. Both are fixed
+   here and in cgi-bin/api: the state lives in lv.off, and lv.epoch decides who
+   is allowed to write it. */
+function lvInfo(j, auth) {
   lv.idle = j.idle_s || lv.idle;
   lv.port = j.api_port || lv.port;
+  if (auth) lv.off = !!j.off;
   var s = $("lvinfo");
   if (s) {
-    if (j.off) s.textContent = "blocked on this camera (Relay: blocked)";
+    if (lv.off) s.textContent = "blocked on this camera (Relay: blocked)";
     else if (!j.running) s.textContent = "idle - starts when a viewer asks (idle timeout " + lv.idle + " s)";
     else s.textContent = "running (pid " + j.pid + ", " + mb(j.rss_kb) + " MB) - " + j.state;
   }
-  if ($("lvrtsp")) $("lvrtsp").textContent = j.off ? "--" : (j.rtsp_out || "--");
+  if ($("lvrtsp")) $("lvrtsp").textContent = lv.off ? "--" : (j.rtsp_out || "--");
   if ($("lvui")) {
-    var p = j.off ? "" : (j.page || (lvBase() + "/"));
+    var p = lv.off ? "" : (j.page || (lvBase() + "/"));
     $("lvui").href = p || "#";
     $("lvui").textContent = p || "--";
   }
   var t = $("lvtoggle");
-  if (t) t.textContent = j.off ? "Relay: blocked" : "Relay: allowed";
+  /* While a click is in the air the button shows what it is doing, not what it
+     was. Repainting it from a reply that arrives mid-flight is how it came to
+     lie about the state it was in the middle of changing. The button also starts
+     out disabled and saying "reading": the page may not print a switch state it
+     has not been told. */
+  if (t && !lv.mutating) {
+    t.textContent = lv.off ? "Relay: blocked" : "Relay: allowed";
+    t.disabled = false;
+  }
 }
 
-/* The ordinary 1.5 s status poll now carries the relay's coarse state, so the
-   Camera card stays truthful without a second request per poll. lvInfo() refines
-   it with pid/RSS whenever a live_* endpoint answers. */
-function lvPollStatus(j) {
+/* The ordinary status poll carries the relay's coarse state, so the Camera card
+   stays truthful without a second request per poll. lvInfo() refines it with
+   pid/RSS whenever a live_* endpoint answers.
+   <ep> is lv.epoch as it was when this poll was sent: if the switch has been
+   touched since, this reply is stale and gets no say about it. */
+function lvPollStatus(j, ep) {
   lv.port = j.live_port || lv.port;
   var host = j.ip || location.hostname || "192.168.10.46";
+  if (!lv.mutating && ep === lv.epoch) lv.off = !!j.live_off;
   var t = $("lvtoggle");
-  if (t) t.textContent = j.live_off ? "Relay: blocked" : "Relay: allowed";
+  if (t && !lv.mutating) {
+    t.textContent = lv.off ? "Relay: blocked" : "Relay: allowed";
+    t.disabled = false;
+  }
   var s = $("lvinfo");
   /* Also refreshed while a preview is wanted, and that is not cosmetic: after the
      "Stop relay now" button (or the idle reaper, or a crash) the card used to keep
      saying "running (pid 17846, 11.8 MB)" indefinitely, because the refresh was
      gated on !lv.want. A panel that names a PID that no longer exists is a lie. */
   if (s && (!lv.want || !j.live_running)) {
-    if (j.live_off) s.textContent = "blocked on this camera (Relay: blocked)";
+    if (lv.off) s.textContent = "blocked on this camera (Relay: blocked)";
     else if (j.live_running) s.textContent = "running now - see the Live view panel";
     else s.textContent = "idle - starts when a viewer asks";
   }
-  if ($("lvrtsp")) $("lvrtsp").textContent = j.live_off ? "--" : "rtsp://" + host + ":" + (j.live_rtsp_port || 8554) + "/cam";
+  if ($("lvrtsp")) $("lvrtsp").textContent = lv.off ? "--" : "rtsp://" + host + ":" + (j.live_rtsp_port || 8554) + "/cam";
   if ($("lvui")) {
-    var p = j.live_off ? "" : "http://" + host + ":" + (j.live_port || 1984) + "/";
+    var p = lv.off ? "" : "http://" + host + ":" + (j.live_port || 1984) + "/";
     $("lvui").href = p || "#";
     $("lvui").textContent = p || "--";
   }
   if (!j.live_running && lv.want && lv.playing) lvChip("relay stopped on the camera", "bad");
+}
+
+/* One relay mutation in flight at a time. Both the switch and "Stop relay now"
+   go through here, because on this camera each of them is a forked CGI on a
+   one-core box and two of them at once have no defined order. The buttons are
+   disabled rather than merely ignored so a second click cannot look like an
+   ignored one, and lv.epoch is bumped on the way out so anything still in the
+   air from before the click cannot speak for the switch afterwards. */
+function lvMutate(act) {
+  if (lv.mutating) return null;
+  lv.mutating = true;
+  lv.epoch++;
+  $("lvtoggle").disabled = true;
+  $("lvoffbtn").disabled = true;
+  /* Starting a preview is held too: if it were allowed while a block was in the
+     air, the viewer could launch a supervisor that the block's teardown - which
+     only chases the pids it saw at entry - would not stop, leaving a relay
+     running behind a switch that says blocked. */
+  $("lvbtn").disabled = true;
+  return api({ act: act }).then(
+    function (j) {
+      lv.mutating = false;
+      lv.epoch++;
+      $("lvtoggle").disabled = false;
+      $("lvoffbtn").disabled = false;
+      $("lvbtn").disabled = false;
+      return j;
+    },
+    function () {
+      lv.mutating = false;
+      lv.epoch++;
+      $("lvtoggle").disabled = false;
+      $("lvoffbtn").disabled = false;
+      $("lvbtn").disabled = false;
+      return null;
+    });
 }
 
 function lvShow() {
@@ -486,7 +586,7 @@ function lvStart() {
       if (j && j.err) msg(j.err, true);
       return;
     }
-    lvInfo(j);
+    lvInfo(j, true);          /* this reply is the camera's current word on the switch */
     if (!lv.timer) lv.timer = setInterval(lvBeat, 8000);
     if (!j.started && j.running) { lvUp(0); return; }
     // live_start answers at once - on a one-CPU box with a one-connection
@@ -522,7 +622,7 @@ function lvWaitUp(tries) {
     api({ act: "live_status" }).then(function (j) {
       if (!lv.want) return;
       if (j && j.ok) {
-        lvInfo(j);
+        lvInfo(j, false);     /* a periodic read: it may be stale, so no say on the switch */
         if (j.running) { lvUp(tries * 1500); return; }
         // A supervisor that is alive but has no relay has already given its
         // reason in state; showing it beats a bare timeout.
@@ -546,7 +646,7 @@ function lvBeat() {
   if (!lv.want) return;
   api({ act: "live_beat" }).then(function (j) {
     if (!j || !j.ok) return;
-    lvInfo(j);
+    lvInfo(j, false);         /* a periodic read: it may be stale, so no say on the switch */
     if (!j.running) {
       lvChip("relay stopped on the camera (" + (j.state || "?") + ")", "bad");
       if (lv.want) { lv.playing = false; setTimeout(function () { if (lv.want) lvStart(); }, 1500); }
@@ -956,22 +1056,50 @@ function lvFail(why) {
 
 
 $("lvbtn").onclick = function () { if (lv.want) lvLeave(); else lvStart(); };
+
 $("lvoffbtn").onclick = function () {
   /* Leave the preview first. "Stop relay now" is an explicit request to free the
      camera, but the page still had lv.want set, so its 8 s beat saw running=0 and
      politely started the relay straight back up - the button and the page fought,
      and a status check a minute later showed running=1 with state=stopped. */
+  if (lv.mutating) return;
+  var self = this, was = self.textContent;
   lvLeave();
-  api({ act: "live_stop" }).then(function (j) {
-    if (j && j.ok) { lvInfo(j); lvChip("relay stopped - camera freed", "ok"); msg("relay stopped on the camera"); }
+  var p = lvMutate("live_stop");
+  if (!p) return;
+  self.textContent = "Stopping...";
+  p.then(function (j) {
+    self.textContent = was;
+    if (!j || !j.ok) { msg("relay still up - the camera did not answer the stop request", true); return; }
+    lvInfo(j, true);
+    lvChip("relay stopped - camera freed", "ok");
+    msg("relay stopped on the camera");
   });
 };
+
+/* The switch. Which way to go is decided from lv.off - what the camera last told
+   us - and NOT from the word printed on the button. That was the bug that made it
+   one-way: a status poll that left before the click could land after the click's
+   reply and print the old word back, and from then on every click asked for the
+   state the camera was already in, so the switch never came back. The camera also
+   used to take ~3 s to answer, holding its one-connection web server and
+   guaranteeing such a poll was in flight; it answers in about a second now. */
 $("lvtoggle").onclick = function () {
-  var blocked = this.textContent.indexOf("blocked") >= 0;
-  api({ act: blocked ? "live_on" : "live_off" }).then(function (j) {
-    if (!j || !j.ok) return;
-    lvInfo(j);
-    if (j.off) { if (lv.want) lvLeave(); msg("relay blocked on this camera until re-enabled", true); }
+  if (lv.mutating) return;
+  var self = this, block = !lv.off;
+  var p = lvMutate(block ? "live_off" : "live_on");
+  if (!p) return;
+  self.textContent = block ? "Blocking..." : "Allowing...";
+  p.then(function (j) {
+    if (!j || !j.ok) {
+      /* Say what failed, and put the button back to the last state the camera
+         actually reported. A silent return here is what made this look dead. */
+      self.textContent = lv.off ? "Relay: blocked" : "Relay: allowed";
+      msg((j && j.err) ? j.err : "the camera did not answer the relay switch", true);
+      return;
+    }
+    lvInfo(j, true);
+    if (lv.off) { if (lv.want) lvLeave(); msg("relay blocked on this camera until re-enabled", true); }
     else msg("relay allowed - it still only runs while a viewer asks");
   });
 };

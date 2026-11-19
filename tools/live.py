@@ -17,6 +17,8 @@ decoding. It runs only while a viewer is asking.
     ./live.py --test           prove media flows, then prove that stopping puts
                                the camera back exactly as it was
     ./live.py --idle-test      prove the idle reaper shuts the relay down alone
+    ./live.py --toggle-test    prove the block/allow switch works both ways and
+                               that the relay starts again after unblocking
     ./live.py --boot-check     what the camera runs straight after a reboot
     ./live.py --reboot         reboot, wait for the UI, then --boot-check
 
@@ -535,6 +537,139 @@ def do_idle_test(cam):
     return c.summary()
 
 
+def do_toggle_test(cam):
+    """Prove the block/allow switch is a switch.
+
+    This is the contract the page depends on, and it broke in a way that looked
+    like a dead button: the CGI ran the whole teardown before answering, holding
+    the camera's one-connection web server for ~3 s, so the page's own status
+    polls queued behind the click and landed out of order on top of it. The
+    switch's state was then read back out of the button's label and used to
+    decide what to send next - so one stale reply was enough for every later
+    click to ask for the state the camera was already in.
+
+    What must hold, from the API alone (the page is covered by tools/switch-check.mjs):
+      - live_off creates the flag and live_on removes it, every time, in both
+        directions, and each reply reports the state it just wrote;
+      - the reply goes out BEFORE the teardown finishes (it still sees the relay
+        running). That ordering is the fix: held up by the teardown, the CGI kept
+        the camera's one-connection web server for seconds and the page's own
+        status polls came back over the click out of order;
+      - the backgrounded teardown does stop the relay a moment later;
+      - a blocked relay refuses live_start, and the refusal says how to unblock it;
+      - after live_on the relay starts again - the reported bug was that it never
+        could;
+      - a stop does not kill a relay started after it, and does not take its lock
+        or pidfiles away: the teardown now runs in the background, so it may only
+        touch what it saw when it started.
+    """
+    c = Checks()
+    was_off = api("live_status", timeout=20).get("off") == 1
+
+    def flag():
+        return "PRESENT" in cam.run(
+            "ls /mnt/camweb/live/disable >/dev/null 2>&1 && echo PRESENT || echo ABSENT")
+
+    def timed(act):
+        t0 = time.time()
+        j = api(act, timeout=30)
+        return j, int((time.time() - t0) * 1000)
+
+    def up(timeout=40):
+        for _ in range(timeout // 4):
+            time.sleep(4)
+            if api("live_status", timeout=20).get("running") == 1:
+                return True
+        return False
+
+    try:
+        api("live_on", timeout=30)
+        time.sleep(2)
+        c.add("starts allowed", api("live_status", timeout=20).get("off") == 0 and not flag(),
+              "flag=%s" % flag())
+
+        api("live_start", timeout=30)
+        c.add("relay starts when allowed", up(), "state=%s" % api("live_status", timeout=20).get("state"))
+
+        # Timing cannot be judged against an absolute budget: this box's baseline
+        # swings from ~1 s idle to ~9 s with the relay running at load 15, and the
+        # old bug (3.3 s) would hide inside that. What is deterministic is the
+        # ORDER: the flag is written and the reply printed before the teardown is
+        # forked, so the reply must still see the relay running. When the teardown
+        # ran inside the request, the reply always reported running=0 - the relay
+        # was already gone by the time the page heard anything.
+        j, ms = timed("live_off")
+        c.add("live_off writes the flag before answering", j.get("ok") == 1 and j.get("off") == 1,
+              "ok=%s off=%s blocked=%s" % (j.get("ok"), j.get("off"), j.get("blocked")))
+        c.add("live_off answers while the teardown is still running", j.get("running") == 1,
+              "reply said running=%s (0 means the request waited for the teardown), %d ms" % (j.get("running"), ms))
+        time.sleep(1)
+        c.add("live_off wrote the flag on the card", flag(), "flag=%s" % flag())
+
+        refused = api("live_start", timeout=30)
+        c.add("blocked relay refuses to start", refused.get("ok") == 0,
+              "err=%s" % str(refused.get("err"))[:70])
+        c.add("refusal names the switch, not a shell command",
+              "button" in str(refused.get("err", "")), str(refused.get("err"))[:70])
+
+        # The teardown was left to run in the background; it still has to happen.
+        gone, waited = False, 0
+        while waited < 40:
+            time.sleep(4); waited += 4
+            if api("live_status", timeout=20).get("running") != 1:
+                gone = True
+                break
+        c.add("the backgrounded teardown really stops the relay", gone, "after %d s" % waited)
+
+        j, ms = timed("live_on")
+        c.add("live_on reports allowed in its own reply", j.get("ok") == 1 and j.get("off") == 0,
+              "ok=%s off=%s blocked=%s in %d ms" % (j.get("ok"), j.get("off"), j.get("blocked"), ms))
+        time.sleep(1)
+        c.add("live_on removed the flag", not flag(), "flag=%s" % flag())
+
+        api("live_start", timeout=30)
+        c.add("relay starts again after unblocking (the reported bug)", up(),
+              "state=%s" % api("live_status", timeout=20).get("state"))
+
+        # The teardown is backgrounded now, so it must not reach past its own
+        # start: a viewer who stops and immediately starts must keep the relay.
+        # The window is generous because go2rtc on a loaded ARM9 core can take
+        # tens of seconds to bind; what is being tested is that the old stopper
+        # neither kills the new supervisor nor steals its lock.
+        api("live_stop", timeout=30)
+        time.sleep(1)
+        api("live_start", timeout=30)
+        back = up(80)
+        s = api("live_status", timeout=20)
+        c.add("a stop does not kill a relay started after it",
+              back and s.get("running") == 1 and s.get("sup"),
+              "running=%s sup=%s state=%s" % (s.get("running"), s.get("sup"), s.get("state")))
+        sup = str(s.get("sup") or "")
+        c.add("the new supervisor still owns its lock and pidfiles",
+              sup.isdigit() and "ALIVE" in cam.run(
+                  "[ -d /proc/%s ] && echo ALIVE || echo GONE" % sup),
+              "supervisor pid=%s" % sup)
+
+        for act, want in (("live_off", 1), ("live_on", 0), ("live_off", 1), ("live_on", 0)):
+            j = api(act, timeout=30)
+            time.sleep(1)
+            c.add("%s toggles (%s)" % (act, "blocked" if want else "allowed"),
+                  j.get("off") == want and flag() == bool(want),
+                  "reply off=%s flag=%s" % (j.get("off"), flag()))
+
+        st = api("status", timeout=20)
+        c.add("status reports the same field as the live_* replies",
+              st.get("live_off") == api("live_status", timeout=20).get("off"),
+              "status live_off=%s" % st.get("live_off"))
+    finally:
+        api("live_stop", timeout=45)
+        time.sleep(3)
+        if was_off:
+            api("live_off", timeout=30)
+        log("left as found: off=%s flag=%s" % (api("live_status", timeout=20).get("off"), flag()))
+    return c.summary()
+
+
 def supervisor_pid(cam):
     """The supervisor's recorded PID, from the lock directory that owns it, with
     a zombie check. Walking /proc with a grep per entry would mean ~90 process
@@ -709,6 +844,8 @@ def main():
             return do_idle_test(shell())
         if "--race-test" in args:
             return do_race_test(shell())
+        if "--toggle-test" in args:
+            return do_toggle_test(shell())
         if "--boot-check" in args:
             return do_boot_check(shell())
         if "--reboot" in args:

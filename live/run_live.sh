@@ -160,7 +160,27 @@ log "lock taken pid=$$ ppid=$(awk '{print $4}' /proc/$$/stat 2>/dev/null) comm=$
 # with its own go2rtc, and the second one's "is the port up?" check passes
 # because the *other* one is holding the port. Checking ownership every beat
 # makes the superseded one leave instead.
-owns_lock() { [ "$(cat $LOCK/pid 2>/dev/null)" = "$$" ]; }
+owns_lock() {
+  if [ ! -d "$LOCK" ]; then
+    # A missing lock directory is not the same as being superseded: whoever
+    # supersedes this supervisor replaces the directory, it does not simply
+    # remove it, and the removal is what a teardown running in the background
+    # does. Treating that as superseded made this supervisor leave without
+    # cleanup and orphan its go2rtc - which kept holding :1984 and :8554 behind
+    # empty pidfiles, so the page reported the relay as not running and nothing
+    # could stop it. Nobody holds the lock now, so take it back and go on.
+    mkdir "$LOCK" 2>/dev/null
+    if [ -d "$LOCK" ]; then
+      echo $$ > $LOCK/pid
+      echo $$ > $PIDF
+      heartbeat
+      log "lock had vanished; retaken as pid $$"
+      return 0
+    fi
+    return 1
+  fi
+  [ "$(cat $LOCK/pid 2>/dev/null)" = "$$" ]
+}
 
 
 

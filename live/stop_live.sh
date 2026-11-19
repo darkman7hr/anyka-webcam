@@ -40,7 +40,13 @@ esac
 
 
 # Ask first: the supervisor's TERM trap does the ordered teardown.
+# Snapshot the two pids ONCE and chase only those. This script now runs in the
+# background behind the CGI's reply, so a viewer can press Start a second later
+# and launch a new supervisor while this loop is still turning; re-reading the
+# pidfiles each round would let a stop click kill the relay that was started
+# after it - one of the ways the relay looked unstartable.
 sp=$(cat $PIDF 2>/dev/null)
+gp=$(cat $G2F 2>/dev/null)
 if [ -n "$sp" ] && [ -d /proc/$sp ]; then
   printf '1\n' > $STOPF 2>/dev/null
   kill $sp 2>/dev/null
@@ -49,13 +55,13 @@ fi
 # Then make sure nothing is left holding a port or a memory policy.
 i=0
 while [ $i -lt 6 ]; do
-  gp=$(cat $G2F 2>/dev/null)
-  sp=$(cat $PIDF 2>/dev/null)
   if [ -n "$gp" ] && [ -d /proc/$gp ]; then kill $gp 2>/dev/null; fi
   # The supervisor's TERM trap waits for go2rtc to exit (up to 5 s) before it
   # lifts the producer's OOM protection. Escalating too early SIGKILLs it mid
-  # teardown and leaves the producer pinned at -500 forever.
-  if [ $i -ge 6 ] && [ -n "$sp" ] && [ -d /proc/$sp ]; then kill -9 $sp 2>/dev/null; fi
+  # teardown and leaves the producer pinned at -500 forever, so this happens on
+  # the last round only. (It used to read `[ $i -ge 6 ]` inside `while [ $i -lt 6 ]`,
+  # which is unreachable - a wedged supervisor was never killed at all.)
+  if [ $i -ge 5 ] && [ -n "$sp" ] && [ -d /proc/$sp ]; then kill -9 $sp 2>/dev/null; fi
   gone=1
   [ -n "$gp" ] && [ -d /proc/$gp ] && gone=0
   [ -n "$sp" ] && [ -d /proc/$sp ] && gone=0
@@ -82,7 +88,38 @@ for d in /proc/[0-9]*; do
   printf '0\n' > $d/oom_score_adj 2>/dev/null
 done
 
-rm -f $PIDF $G2F $STOPF /tmp/live_ready
-rm -rf $LOCKF
-printf '%s\n' "${1#--}" > $STATE 2>/dev/null
+# Only unlink state that still names what this run stopped.
+#
+# This script now runs in the background, behind the CGI's reply, so a viewer who
+# presses Start a moment later has a fresh supervisor writing these very files
+# while this cleanup is still turning. Unlinking them blindly took the lock away
+# from that supervisor: it decided it had been superseded (by an empty pid),
+# exited without cleanup, and left its go2rtc orphaned - holding :1984 and :8554
+# with no supervisor and empty pidfiles behind it. The page then reported the
+# relay as not running while the relay was in fact up, and nothing could stop it.
+own() {  # $1 = file, $2 = pid this run saw there
+  [ -f "$1" ] || return 0
+  cur=$(cat $1 2>/dev/null)
+  if [ -n "$2" ]; then
+    [ "$cur" = "$2" ] && rm -f "$1"          # still ours: release it
+  elif [ -z "$cur" ] || [ ! -d /proc/$cur ]; then
+    rm -f "$1"                               # only ever a leftover of something dead
+  fi
+  return 0
+}
+own $PIDF "$sp"
+own $G2F "$gp"
+if [ -d "$LOCKF" ]; then
+  lp=$(cat $LOCKF/pid 2>/dev/null)
+  if [ -n "$sp" ]; then
+    [ "$lp" = "$sp" ] && rm -rf $LOCKF
+  elif [ -z "$lp" ] || [ ! -d /proc/$lp ]; then
+    rm -rf $LOCKF
+  fi
+fi
+alive=$(cat $PIDF 2>/dev/null)
+if [ -z "$alive" ] || [ ! -d /proc/$alive ]; then
+  rm -f $STOPF /tmp/live_ready
+  printf '%s\n' "${1#--}" > $STATE 2>/dev/null
+fi
 echo "live relay stopped"

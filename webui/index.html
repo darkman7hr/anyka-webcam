@@ -44,6 +44,11 @@ main{max-width:1200px;margin:0 auto;padding:12px;display:grid;gap:12px;grid-temp
 .btn.pri{background:var(--acc2);border-color:var(--acc);color:#fff;font-weight:600}
 a.btn{text-decoration:none;display:inline-block;text-align:center}
 .btn.pri:hover{background:#2b7ff5}
+/* A disabled control has to look disabled: an unresponsive button that still
+   lights up on hover is indistinguishable from one that has stopped working. */
+.btn:disabled{opacity:.5;cursor:default;background:var(--panel2);border-color:var(--line);transform:none}
+.btn:disabled:hover{background:var(--panel2);border-color:var(--line)}
+.btn:disabled:active{transform:none}
 .center-cell{display:flex;align-items:center;justify-content:center;font-size:10px;color:var(--dim);letter-spacing:.1em;text-transform:uppercase}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 .row+.row{margin-top:10px}
@@ -228,7 +233,7 @@ hr{border:0;border-top:1px solid var(--line);margin:14px 0}
         <hr>
         <div class="row">
           <button class="btn sm" id="lvoffbtn" style="flex:1">Stop relay now</button>
-          <button class="btn sm" id="lvtoggle">Relay: allowed</button>
+          <button class="btn sm" id="lvtoggle" disabled>Relay: reading&hellip;</button>
         </div>
         <div class="hint"><b>Stop relay now</b> frees the camera's RAM for every viewer at once.
           <b>Relay: allowed/blocked</b> is a switch on the card (<code>/mnt/camweb/live/disable</code>): while blocked
