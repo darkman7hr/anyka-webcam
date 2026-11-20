@@ -118,12 +118,43 @@
  * lands in y and the height is thrown away - which is what happens. ak_osd_init,
  * ak_osd_get_max_rect, ak_osd_set_font_file and ak_osd_destroy do match the
  * header; these three do not.
+ *
+ *   ak_osd_draw_matrix(channel, yoff, xoff, h, w, buf, len)  seven, not eight
+ *       r0 is the video channel, r1 the row of the rect the block starts at, r2
+ *       the column it starts at, r3 the block height, the first stack slot the
+ *       block width, then the pointer and the length; the header's second
+ *       argument, a rect index this generation does not have, is not there and
+ *       the two offsets come before the sizes. The length has to be at least
+ *       width*height/2 or the call returns 1 with "param err". What it does with
+ *       the block is one memcpy into the canvas - no pixel maths at all.
+ *
+ * That last point is why the overlay is drawn with draw_matrix and not draw_str.
+ * The canvas is 4 bpp: set_rect allocates rect_w*rect_h/2 bytes, and the display
+ * path reads it two pixels to the byte. draw_str does not know that. Its inner
+ * loop (0x1a94-0x1b10) takes one bit out of the font cell and writes it to
+ * canvas byte (pixel/8) at bit (7 - pixel%8) - one bit per pixel, one byte per
+ * eight pixels. On a canvas the display reads two pixels to the byte, so every
+ * glyph lands spread across the wrong bytes: what a grabbed frame shows is a
+ * comb of 4 px bars every 8 px, ticking over with the clock and unreadable.
+ * Measured on 20 Nov, and it is why --osd-time looked broken for as long as it
+ * did. draw_matrix writes the bytes the display expects, so the pixels end up
+ * exactly where they were computed - one line, where it is asked for.
+ *
+ * The canvas is column-major: rect_w columns of rect_h/2 bytes, which is what
+ * the copy loop steps. The block goes in as one run, so a block shorter than the
+ * rect leaves the rest of the canvas as it came out of the pmem pool, and the
+ * range checks are cross-wired - the block's width is measured against the
+ * rect's HEIGHT and its height against its width ("para err, osd_w: 500,
+ * osd_h: 64" for a 500x64 block in a 500x64 rect, measured 20 Nov). osd_open()
+ * keeps the rect square for that reason and osd_draw() always sends all of it.
  */
 typedef int (*osd_set_rect_fn)(void *vi, int channel, int x, int y, int w, int h);
 typedef int (*osd_draw_str_fn)(int channel, int xoff, int yoff,
 			       const unsigned short *str, int len);
 typedef int (*osd_clean_str_fn)(int channel, int xoff, int row, int unused1,
 				int unused2);
+typedef int (*osd_draw_matrix_fn)(int channel, int yoff, int xoff, int h, int w,
+				  const unsigned char *bits, unsigned int len);
 
 /* The (void *) hop is deliberate: casting one function pointer type to another
  * directly makes gcc warn, and the warning would be the only thing standing
@@ -136,6 +167,20 @@ static const osd_draw_str_fn osd_draw_str =
 	(osd_draw_str_fn)(void *)ak_osd_draw_str;
 static const osd_clean_str_fn osd_clean_str =
 	(osd_clean_str_fn)(void *)ak_osd_clean_str;
+static const osd_draw_matrix_fn osd_draw_matrix =
+	(osd_draw_matrix_fn)(void *)ak_osd_draw_matrix;
+
+/*
+ * The vendor's font bin, as far as the overlay needs it: the ASCII half, which
+ * is the first 4096 bytes of /usr/local/ak_font_16.bin. Each cell is 16 bytes,
+ * one byte per row, bit 7 the leftmost pixel - an 8 x 16 cell. That is how the
+ * file identifies itself: cell 1 is the CP437 smiley (7e 81 a5 81 81 bd 99 81
+ * 81 7e) and cell 0 is blank, and cell '0' (0x30) at offset 768 renders as a
+ * zero. Everything past the first 4096 bytes is the GB2312 half, which a date
+ * never asks for.
+ */
+#define OSD_FONT_CELL		16
+#define OSD_FONT_ASCII_BYTES	(256 * OSD_FONT_CELL)
 
 #define CH_MAIN 0
 #define CH_SUB 1
@@ -215,11 +260,40 @@ static int g_osd_ch[N_CH] = { 1, 1 };	/* which encode channels get it */
 static int g_osd_h[N_CH];		/* the rect height each channel accepted */
 static int g_osd_w[N_CH];		/* and its width */
 static int g_osd_clean_warned[N_CH];	/* say once that the clear is failing */
-static int g_osd_color = -1, g_osd_bg = -1;	/* -1: leave the library's own */
+/*
+ * Palette indices for the overlay, not RGB. ak_osd_set_color() stores the front
+ * index at osd+0x84 and the background at +0x88 of the library's own struct,
+ * and nothing else ever writes them: left alone, they sit in .bss as 0, and
+ * index 0 is black - which is why a burned-in date here came out as dark strokes
+ * on a dark corner and looked like nothing at all. Index 1 is the bright entry
+ * (and the value ak_osd_draw_str() paints with), so white-on-black is the
+ * default and --osd-color / --osd-bg can move it.
+ */
+static int g_osd_color = 1, g_osd_bg = 0;
 static int g_osd_alpha = -1;
 static int g_osd_rect_h;			/* rect height; 0 = twice the font */
 static int g_osd_xoff, g_osd_yoff;
 static char g_osd_text[64];		/* exactly what is on the picture now */
+
+/*
+ * Drawing the pixels here instead of letting the library do it. --osd-no-matrix
+ * goes back to ak_osd_draw_str(), which is the path that smears (see the ABI
+ * note above); it stays in the build so the difference can be shown on one
+ * camera rather than argued about.
+ */
+static int g_osd_matrix = 1;
+static int g_osd_probe;			/* calibration pattern, not the clock */
+static int g_osd_scale = 2;		/* the 8x16 vendor cell, times this */
+static int g_osd_nibble_hi;		/* 1 = the left pixel of a pair is the
+					 * high nibble; 0 = the low one. Which
+					 * way round the display reads a byte is
+					 * one bit, so it is a flag and not a
+					 * guess baked into the code. */
+#define OSD_BITS_MAX		(1280 * 720 / 2 + 64)	/* the whole canvas, 4 bpp */
+static unsigned char g_font[256][OSD_FONT_CELL];
+static int g_font_ready;
+static unsigned char g_osd_bits[OSD_BITS_MAX];
+static int g_osd_matrix_warned;
 
 static void osd_draw(int force);
 static void clock_poll(void);
@@ -1492,6 +1566,230 @@ static void osd_place(int max_w, int max_h, int w, int h, int *x, int *y)
 }
 
 /*
+ * The ASCII half of the vendor's font bin: one 16-byte cell per code, one byte
+ * per row, bit 7 the leftmost pixel. Read once at start-up, because the one
+ * thing this library gets wrong is what a glyph is made of. Checked rather than
+ * trusted: a file whose '0' carries no ink is not a font this code can use, and
+ * saying so beats burning a blank bar into every recording.
+ */
+static int osd_load_font(void)
+{
+	unsigned char *bytes = &g_font[0][0];
+	FILE *f;
+	size_t got;
+	int i, ink = 0;
+
+	if (g_font_ready)
+		return 0;
+	f = fopen(g_osd_font_file, "rb");
+	if (!f)
+		return -1;
+	got = fread(bytes, 1, OSD_FONT_ASCII_BYTES, f);
+	fclose(f);
+	if (got < OSD_FONT_ASCII_BYTES) {
+		logmsg("osd: %s gave %zu of the %d bytes the ASCII cells need\n",
+		       g_osd_font_file, got, OSD_FONT_ASCII_BYTES);
+		return -1;
+	}
+	for (i = 0; i < OSD_FONT_CELL; i++) {
+		unsigned char b = g_font['0'][i];
+		while (b) {
+			ink += b & 1;
+			b >>= 1;
+		}
+	}
+	if (ink < 8) {
+		logmsg("osd: %s has no usable glyph for '0' (%d lit pixels) - "
+		       "not this vendor's font\n", g_osd_font_file, ink);
+		return -1;
+	}
+	g_font_ready = 1;
+	return 0;
+}
+
+/*
+ * Geometry for the matrix path. The rect IS the bitmap, and the bitmap is the
+ * whole rect: ak_osd_draw_matrix() memcpy's the block into the canvas, so a
+ * block narrower than the rect's stride slides across its own rows, and a block
+ * shorter than the rect leaves the rest of the canvas as it came out of the pmem
+ * pool - which is whatever the last process left there, burned into the NVR's
+ * recording beside the date.
+ *
+ * The rect has to be at least as tall as it is wide, because this library
+ * range-checks the block with the two dimensions crossed over. Its own error
+ * says so: for a 500 px block in a 500x64 rect it prints "para err, osd_w: 500,
+ * osd_h: 64" - the block's width is measured against the rect's HEIGHT and its
+ * height against the rect's width. Measured on 20 Nov, and it is why the rect
+ * here is square rather than a band.
+ */
+static void osd_matrix_dims(int chars, int max_w, int max_h, int *adv, int *gh,
+			    int *w, int *h)
+{
+	int lim = max_w < max_h ? max_w : max_h;	/* what draw_matrix allows */
+
+	*adv = 8 * g_osd_scale + 2 * g_osd_scale;
+	*gh = OSD_FONT_CELL * g_osd_scale;
+	if (chars * *adv > lim) {
+		/* Prefer losing padding to losing glyph size: the rect only has
+		 * to hold the text, and "%Y-%m-%d %H:%M:%S" never needs more
+		 * than 20 of the 27 slots the worst-case format allows. */
+		int fit = lim / *adv;
+
+		if (fit >= 20) {
+			chars = fit;
+		} else {
+			g_osd_scale = 1;
+			*adv = 8 * g_osd_scale + 2 * g_osd_scale;
+			*gh = OSD_FONT_CELL * g_osd_scale;
+			if (chars * *adv > lim)
+				chars = lim / *adv;
+		}
+	}
+	*w = chars * *adv;
+	if (*w % 2)
+		(*w)++;			/* the canvas is two pixels to the byte */
+	*h = *gh;
+	if (*h < 2 * g_osd_size)
+		*h = 2 * g_osd_size;	/* set_rect refuses a shorter rect */
+	if (*h < *w)
+		*h = *w;		/* what draw_matrix's check wants */
+	if (*h > max_h) {
+		*h = max_h;
+		if (*w > *h)
+			*w = *h & ~1;
+	}
+}
+
+/* Set one pixel of the canvas image: 4 bpp, 0 transparent.
+ *
+ * Column-major, and that is not a style choice. The canvas is rect_w columns of
+ * rect_h/2 bytes each - which is what ak_osd_draw_matrix()'s own copy loop
+ * steps (width iterations, height/2 bytes per iteration, advancing height/2
+ * bytes), and what the display reads. Written row-major the picture comes back
+ * transposed: measured on 20 Nov, where a probe line across the full width of
+ * the rect appeared as a line down the full height at x = w/2. */
+/* One pixel of the canvas with an explicit 4 bpp value.
+ *
+ * Row-major, stride rect_w/2 bytes: a byte holds two pixels along the HORIZONTAL
+ * axis, low nibble the left one (until --osd-nibble-hi says otherwise). Proven
+ * with a comb probe rather than reasoned out: 4 px of ink and 4 px of nothing
+ * over a 120 x 120 patch at two corners of the canvas, then correlate the frame
+ * with that square wave along each axis. Written this way the comb stays a comb
+ * and lands where it was placed; the column-major reading that the memcpy loop
+ * in ak_osd_draw_matrix suggests puts it 90 degrees round instead (measured,
+ * 20 Nov). The crossed range checks in that function - the block width counted
+ * against the rect height - are what a canvas indexed [y][x] with a rotated
+ * display would imply, which is why the rect stays square here. */
+static void osd_bitv(int w, int h, int x, int y, int val)
+{
+	size_t at = (size_t)y * (size_t)(w / 2) + (size_t)x / 2;
+	unsigned char *b;
+
+	if (x < 0 || y < 0 || x >= w || y >= h || at >= sizeof g_osd_bits)
+		return;
+	b = &g_osd_bits[at];
+	val &= 0x0f;
+	if (g_osd_nibble_hi) {
+		if (x & 1)
+			*b = (unsigned char)((*b & 0x0f) | (val << 4));
+		else
+			*b = (unsigned char)((*b & 0xf0) | val);
+	} else {
+		if (x & 1)
+			*b = (unsigned char)((*b & 0xf0) | val);
+		else
+			*b = (unsigned char)((*b & 0x0f) | (val << 4));
+	}
+}
+
+/* Ink value written into the 4 bpp canvas. Measured, not assumed: a value ramp
+ * of fifteen stripes (1..15) burned into the picture and diffed against the
+ * same scene without the overlay showed 13, 14 and 15 changing nothing at all,
+ * 5..10 painting the scene uniformly DARK, and 1 making pixels brighter. 1 is
+ * also the only value ak_osd_draw_str() ever writes - its blit sets a single
+ * bit - which is the vendor's own white text. So the nibble is a palette index,
+ * not an opacity: 0 transparent, 1 the foreground colour, 8 black. */
+#define OSD_INK			1
+
+static void osd_bit(int w, int h, int x, int y, int on)
+{
+	osd_bitv(w, h, x, y, on ? OSD_INK : 0x00);
+}
+
+/*
+ * The line as the display wants the bytes. Which of the two pixels packed into
+ * a byte is the left one is the single thing here that cannot be read out of
+ * the library (draw_str never writes a byte the display reads correctly), so
+ * --osd-nibble-hi decides it and the first frame on the camera settles it.
+ */
+static int osd_render_bits(const char *text, int w, int h, int top)
+{
+	int n = (int)strlen(text);
+	int adv = 8 * g_osd_scale + 2 * g_osd_scale;
+	int i, r, c, k, j;
+
+	if ((size_t)w * h / 2 > sizeof g_osd_bits)
+		return -1;
+	memset(g_osd_bits, 0, (size_t)w * h / 2);
+	for (i = 0; i < n; i++) {
+		const unsigned char *cell = g_font[(unsigned char)text[i]];
+		for (r = 0; r < OSD_FONT_CELL; r++) {
+			unsigned char row = cell[r];
+			if (!row)
+				continue;
+			for (c = 0; c < 8; c++) {
+				if (!((row >> (7 - c)) & 1))
+					continue;
+				for (k = 0; k < g_osd_scale; k++)
+					for (j = 0; j < g_osd_scale; j++)
+						osd_bit(w, h, i * adv + c * g_osd_scale + j,
+							top + r * g_osd_scale + k, 1);
+			}
+		}
+	}
+	return 0;
+}
+
+/*
+ * Calibration pattern, for the one question a frame can answer and a
+ * disassembly cannot: which way round the display reads a packed byte, and
+ * whether row 0 of the rect is its top. A full line at the very top and the
+ * very bottom of the rect shows the rows; a column at x=0 for the whole height
+ * and a column at x=1 for the lower half only, so the two are one pixel apart
+ * and the parity of the packing shows as which side each one lands on.
+ */
+/*
+ * Calibration in one frame. Fifteen stripes of constant 4 bpp value (1..8
+ * above, 9..15 below), a one-pixel marker along the top edge and down the left
+ * edge, and a full-width line at value 1 - the value the library's own text
+ * blit writes - as the control. The stripes say which canvas values the display
+ * draws at all and how strongly: 0xf as "ink" is a reading of the canvas format
+ * and not a fact from a header, so it gets measured. The markers say where row
+ * 0 and column 0 of the rect land in the picture, which is the other thing a
+ * column-major canvas can get wrong.
+ */
+static void osd_probe_bits(int w, int h)
+{
+	int x, y;
+
+	memset(g_osd_bits, 0, (size_t)w * (size_t)h / 2);
+	/* A comb: 4 px of ink, 4 px of nothing, over a 120 x 120 patch. A scene
+	 * does not produce that period, so a frame can be searched for it
+	 * directly - correlate each window against a square wave of the same
+	 * period along x and along y and the answer says both where the canvas
+	 * landed and whether the display turned it through 90 degrees. Two combs
+	 * at different corners, because a single one cannot tell a transpose
+	 * from a mirror. */
+	for (y = 20; y < 140 && y < h; y++)
+		for (x = 20; x < 140 && x < w; x++)
+			osd_bitv(w, h, x, y, ((x / 4) % 2) ? 0 : OSD_INK);
+	for (y = h - 140; y < h; y++)
+		for (x = w - 140; x < w; x++)
+			osd_bitv(w, h, x, y, ((y / 4) % 2) ? OSD_INK : 0);
+}
+
+
+/*
  * Bring the overlay up. The order is the SDK demo's order and it is not
  * cosmetic: the font is chosen before ak_osd_init() because init sizes its
  * buffers from it. The vendor's own boot log on this exact board shows the same
@@ -1530,6 +1828,12 @@ static int osd_open(void)
 		       g_osd_font_file);
 		return -1;
 	}
+	if (g_osd_matrix && osd_load_font()) {
+		logmsg("osd: the glyphs could not be read out of %s, so this run "
+		       "falls back to ak_osd_draw_str - which smears on this "
+		       "board (see the note by the library calls)\n", g_osd_font_file);
+		g_osd_matrix = 0;
+	}
 	if (ak_osd_set_font_file(g_osd_size, g_osd_font_file)) {
 		logmsg("osd: ak_osd_set_font_file(%d, %s) failed\n",
 		       g_osd_size, g_osd_font_file);
@@ -1563,6 +1867,23 @@ static int osd_open(void)
 			g_osd_ch[ch] = 0;
 			continue;
 		}
+		if (g_osd_matrix) {
+			int adv, gh, want = g_osd_scale;
+
+			/* One line, one bitmap, one copy. The rect is sized
+			 * from the line: draw_matrix memcpy's the block into
+			 * the canvas, so it has to be as wide as the rect and
+			 * as tall as the rect is wide (see osd_matrix_dims). */
+			osd_matrix_dims(chars, max_w, max_h, &adv, &gh, &w, &h);
+			if (g_osd_scale != want)
+				logmsg("osd: %s area is %dx%d and the library will "
+				       "not take a block wider than the rect is "
+				       "tall: glyphs down to %dx%d there\n",
+				       g_prof[ch].name, max_w, max_h,
+				       8 * g_osd_scale, gh);
+			logmsg("osd: %s canvas %dx%d, advance %d, glyphs %dx%d\n",
+			       g_prof[ch].name, w, h, adv, 8 * g_osd_scale, gh);
+		} else {
 		cell_w = g_osd_size > 16 ? g_osd_size : 16;
 		/* The glyph advance comes from the font file, not from --osd-size:
 		 * this board's ak_font_16.bin draws 16 px wide whatever is handed to
@@ -1589,6 +1910,7 @@ static int osd_open(void)
 			w = max_w;
 		if (h > max_h)
 			h = max_h;
+		}
 		osd_place(max_w, max_h, w, h, &x, &y);
 		/*
 		 * No ak_osd_set_rect_enable() here: the header declares it, this
@@ -1603,8 +1925,9 @@ static int osd_open(void)
 		}
 		g_osd_w[ch] = w;
 		g_osd_h[ch] = h;
-		logmsg("osd: %s rect %dx%d at %d,%d of max %dx%d, font %s %dpx, pos %s\n",
-		       g_prof[ch].name, w, h, x, y, max_w, max_h,
+		logmsg("osd: %s rect %dx%d at %d,%d of max %dx%d, %s, font %s %dpx, "
+		       "pos %s\n", g_prof[ch].name, w, h, x, y, max_w, max_h,
+		       g_osd_matrix ? "matrix" : "draw_str",
 		       g_osd_font_file, g_osd_size, g_osd_pos);
 	}
 	if (!g_osd_ch[CH_MAIN] && !g_osd_ch[CH_SUB])
@@ -1644,6 +1967,46 @@ static void osd_draw(int force)
 
 		if (!g_osd_ch[ch])
 			continue;
+		if (g_osd_matrix) {
+			int gh = OSD_FONT_CELL * g_osd_scale;
+			int top = 0;
+
+			/* The rect is square, so the line goes to the edge of
+			 * it that the chosen corner sits on: the bottom for
+			 * "bl"/"br", the top for "tl"/"tr". The rest of the
+			 * rect stays 0, which the display draws as nothing. */
+			if (g_osd_pos[0] == 'b')
+				top = g_osd_h[ch] - gh;
+			if (top < 0)
+				top = 0;
+			if (g_osd_probe)
+				osd_probe_bits(g_osd_w[ch], g_osd_h[ch]);
+			else if (osd_render_bits(text, g_osd_w[ch], g_osd_h[ch], top)) {
+				if (!g_osd_matrix_warned)
+					logmsg("osd: the line does not fit in %dx%d "
+					       "(canvas holds %d bytes); overlay off\n",
+					       g_osd_w[ch], g_osd_h[ch],
+					       (int)sizeof g_osd_bits);
+				g_osd_matrix_warned = 1;
+				g_osd_ch[ch] = 0;
+				continue;
+			}
+			/* Both offsets 0, deliberately: the placement is inside
+			 * the bitmap, and the copy has to start at the first
+			 * byte of the canvas for its rows to stay level. */
+			if (osd_draw_matrix(ch, 0, 0, g_osd_h[ch], g_osd_w[ch],
+					    g_osd_bits,
+					    (unsigned)(g_osd_w[ch] * g_osd_h[ch] / 2))) {
+				if (!g_osd_matrix_warned)
+					logmsg("osd: ak_osd_draw_matrix on %s failed "
+					       "(%dx%d); no overlay there\n",
+					       g_prof[ch].name, g_osd_w[ch], g_osd_h[ch]);
+				g_osd_matrix_warned = 1;
+				g_osd_ch[ch] = 0;
+				continue;
+			}
+			continue;
+		}
 		/* The offsets are relative to the rect, and the library range-checks
 		 * them against the rect that channel was given. Clamping here means a
 		 * --osd-yoff that suits one channel and not the other degrades on the
@@ -2233,6 +2596,8 @@ static void usage(const char *argv0)
 		"         [--osd-no-sub]\n"
 		"         [--osd-font /usr/local/ak_font_16.bin] [--osd-color N]\n"
 		"         [--osd-bg N] [--osd-alpha 1..100]\n"
+		"         [--osd-scale 2] [--osd-nibble-hi] [--osd-no-matrix]\n"
+		"         [--osd-probe]\n"
 		"         [--time-status /tmp/camweb_time.status]\n"
 		"\n"
 		"gop is clamped to at least fps: libakstreamenc dies with SIGFPE at the\n"
@@ -2321,6 +2686,8 @@ int main(int argc, char **argv)
 		{ "osd-fmt", 1, 0, 'T' }, { "osd-no-sub", 0, 0, 'Q' },
 		{ "osd-color", 1, 0, 'W' }, { "osd-bg", 1, 0, 'B' },
 		{ "osd-alpha", 1, 0, 'H' },
+		{ "osd-no-matrix", 0, 0, 'z' }, { "osd-probe", 0, 0, 'q' },
+		{ "osd-scale", 1, 0, 'j' }, { "osd-nibble-hi", 0, 0, 'g' },
 		{ "time-status", 1, 0, 'K' },
 		{ "verbose", 0, 0, 'v' }, { "help", 0, 0, 'h' }, { 0, 0, 0, 0 }
 	};
@@ -2333,7 +2700,7 @@ int main(int argc, char **argv)
 	g_prof[CH_SUB].h = 480;
 
 	while ((c = getopt_long(argc, argv,
-			"p:F:G:M:S:b:k:n:aNAfm:s:D:L:d:l:P:e:w:R:x:y:I:u:C:Oo:Z:t:X:Y:J:T:QW:B:H:K:vh",
+			"p:F:G:M:S:b:k:n:aNAfm:s:D:L:d:l:P:e:w:R:x:y:I:u:C:Oo:Z:t:X:Y:J:T:QW:B:H:K:j:qzgvh",
 			longopts, NULL)) != -1) {
 		switch (c) {
 		case 'p': port = atoi(optarg); break;
@@ -2413,6 +2780,15 @@ int main(int argc, char **argv)
 			break;
 		case 'J':
 			snprintf(g_osd_font_file, sizeof g_osd_font_file, "%s", optarg);
+			break;
+		case 'z': g_osd_matrix = 0; break;
+		case 'q': g_osd_probe = 1; break;
+		case 'g': g_osd_nibble_hi = 1; break;
+		case 'j':
+			g_osd_scale = atoi(optarg);
+			if (g_osd_scale < 1 || g_osd_scale > 4)
+				die("--osd-scale must be 1..4 (the vendor's cell "
+				    "is 8x16)\n");
 			break;
 		case 'T':
 			snprintf(g_osd_fmt, sizeof g_osd_fmt, "%s", optarg);

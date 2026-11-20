@@ -23,8 +23,17 @@ Subcommands:
                     write the argument file with --osd-time, restart the server
     --status        what the server says about the overlay and the clock
     --on / --off    the flag in /mnt/camweb/akrtsp.args, then restart
-    --pos CORNER    tl | tr | bl | br; --size N; --rect-h N; --fmt STRFMT
+    --pos CORNER    tl | tr | bl | br; --size N; --scale N; --rect-h N; --fmt STRFMT
     --shot [FILE]   grab one key frame and measure the ink in the overlay band
+    --legible       read the line back off the picture: how far the ink stands
+                    off the scene behind it, whether the rect holds one line and
+                    not two, and the bright pixels against the glyphs in the
+                    vendor font file. That last comparison is the only check
+                    that tells a readable date from a plausible mess of strokes.
+    --no-matrix     fall back to the library's own text blit, which smears here;
+                    --probe draws the calibration pattern instead of the date,
+                    --nibble-hi flips which half of a canvas byte is the left
+                    pixel (the one thing about this display no header says)
     --proof         grab with the overlay on, turn it off, grab again, and count
                     the pixels that differ - the only check that proves the text
                     is really in the picture rather than in a status file
@@ -88,6 +97,7 @@ BIN_LOG = "/tmp/akrtsp.log"
 FONT = "/usr/local/ak_font_16.bin"
 MODE_FILE = "/mnt/camweb/daynight.conf"	# what the web UI writes; akrtsp obeys it
 URL = "rtsp://%s:554/vs0" % deploy.HOST
+SUB_URL = "rtsp://%s:554/vs1" % deploy.HOST
 
 # The flags this tool owns, as they sit in the argument file. The rest of the line
 # (mode file, force-night, ir-follow) belongs to day/night and is carried through
@@ -430,7 +440,8 @@ def strip_osd(line):
     while i < len(parts):
         p = parts[i]
         if p.startswith("--osd"):
-            if p in ("--osd-time", "--osd-no-sub"):
+            if p in ("--osd-time", "--osd-no-sub", "--osd-probe",
+                     "--osd-nibble-hi", "--osd-no-matrix"):
                 i += 1
             else:
                 i += 2		# the ones that take a value
@@ -608,6 +619,255 @@ def row_diff_profile(w, da, db, rect):
     return out
 
 
+# ---------------------------------------------------------------- legibility
+#
+# Whether the date can be read off the recording is the whole point of the
+# feature, and it is the one thing a status file cannot answer. Three numbers
+# come off a single grabbed frame: how far the ink sits off the scene behind it,
+# whether the rest of the rect is empty (the library's own text blit stamps a
+# second, stretched copy), and how well the bright pixels match the glyphs the
+# server was asked to draw - the last one from the vendor font file itself, so
+# it is a comparison against what the picture should be and not against a
+# guess at what text looks like.
+
+FONT_ASCII = 4096		# the ASCII half: 256 cells of 16 bytes, bit 7 leftmost
+_font = None
+
+
+def font_cells(cam):
+    """The vendor font's ASCII cells, or None. Cell 1 is the CP437 smiley and
+    cell '0' has to carry ink - the same two things osd_load_font() checks on the
+    camera, so a file the server will not draw from is not compared against
+    either."""
+    global _font
+    if _font is not None:
+        return _font
+    data = deploy.ftp_get(FONT) or b""
+    if len(data) < FONT_ASCII:
+        return None
+    if 0x7E not in data[16:32]:
+        return None
+    zero = data[ord("0") * 16:ord("0") * 16 + 16]
+    if sum(bin(b).count("1") for b in zero) < 8:
+        return None
+    _font = data[:FONT_ASCII]
+    return _font
+
+
+def expect_line(fb, text, scale):
+    """The line as osd_render_bits() paints it: one 8x16 cell per character,
+    every pixel a scale x scale block, cells 10*scale apart, from x 0 of the
+    rect. Kept as a list of rows of 0/1 so it can be laid straight over the
+    measured ink."""
+    adv = (8 + 2) * scale
+    w = len(text) * adv
+    rows = [[0] * w for _ in range(16 * scale)]
+    for i, ch in enumerate(text):
+        cell = fb[ord(ch) * 16:ord(ch) * 16 + 16]
+        for r in range(16):
+            bits = cell[r]
+            if not bits:
+                continue
+            for c in range(8):
+                if not (bits >> (7 - c)) & 1:
+                    continue
+                for j in range(scale):
+                    for k in range(scale):
+                        rows[r * scale + k][i * adv + c * scale + j] = 1
+    return rows
+
+
+def template_iou(ink, tpl, span=4):
+    """The best overlap of the measured ink with the expected glyphs, allowing a
+    few pixels of slack in both axes for the encoder's chroma sit and for the
+    rect having been placed with an offset. 1.0 is the same picture twice."""
+    th, tw = len(tpl), len(tpl[0])
+    best = 0.0
+    at = None
+    for dy in range(-span, span + 1):
+        for dx in range(-span, span + 1):
+            inter = union = 0
+            for r in range(th):
+                rr = r + dy
+                if rr < 0 or rr >= len(ink):
+                    continue
+                row = ink[rr]
+                tplrow = tpl[r]
+                for c in range(tw):
+                    cc = c + dx
+                    if cc < 0 or cc >= len(row):
+                        continue
+                    a = tplrow[c]
+                    b = row[cc]
+                    if a or b:
+                        union += 1
+                        inter += 1 if (a and b) else 0
+            score = inter / float(union) if union else 0.0
+            if score > best:
+                best = score
+                at = (dx, dy)
+    return best, at
+
+
+
+def legibility(w, h, d, rect, pos="br", line_h=32, text=None, scale=2):
+    """Measure the burned-in line in a single frame.
+
+    The scene under the text changes slowly across a row, so the baseline for a
+    column is that column's median over a band well above the text; what is left
+    is the overlay. Ink is then the pixels that sit well off that baseline, and
+    three numbers say whether the line can be read: how strong it is, how many
+    rows carry strokes (one line's worth - two would mean the doubling this
+    library's own text blit produces), and how many stroke edges there are
+    (enough to be glyphs rather than a bar).
+
+    Returns None when the rect is not inside the frame.
+    """
+    x, y, rw, rh = rect
+    if rw < 16 or rh < line_h:
+        return None
+    y0 = y + rh - line_h if pos.startswith("b") else y
+    if y0 < 0 or y0 + line_h > h or x + rw > w:
+        return None
+    base_rows = range(max(0, y0 - 2 * line_h), min(h, y0 + line_h))
+    base = []
+    for c in range(rw):
+        v = sorted(luma_at(d, ((r * w + x + c) * 3)) for r in base_rows)
+        base.append(v[len(v) // 2])
+    dev = [[luma_at(d, ((r * w + x + c) * 3)) - base[c] for c in range(rw)]
+           for r in range(y0, y0 + line_h)]
+    # Which way the ink stands out depends on what is behind it: the palette's
+    # foreground over a dark corner reads brighter than its surroundings, over an
+    # IR-lit wall it does not. Both polarities are counted and the one carrying
+    # more ink wins - the same decision a person squinting at the frame makes.
+    lit_up = sum(1 for row in dev for v in row if v > 25)
+    lit_dn = sum(1 for row in dev for v in row if v < -25)
+    sign = 1 if lit_up >= lit_dn else -1
+    ink = [[(sign * v) > 25 for v in row] for row in dev]
+    rows = [sum(row) for row in ink]
+    lit = [i for i, n in enumerate(rows) if n > rw // 8]
+    edges = 0
+    for row in ink:
+        edges += sum(1 for i in range(1, rw) if row[i] != row[i - 1])
+    strength = (sign * sum(dev[r][c] for r in range(line_h) for c in range(rw)
+                           if ink[r][c])) / float(max(1, sum(rows)))
+    # Every other row of the rect that carries ink is a second line, the ghost of
+    # the one just measured, or the library's own text blit leaking through - and
+    # the rect is much bigger than the line, so the band around the line says
+    # nothing about it. Sampled every fourth column, against a baseline taken over
+    # the whole rect (the scene brightens across 500 rows, and the band's baseline
+    # does not reach that far), and only counted as text when the row is broken up
+    # into many short runs: glyph strokes do that, a window frame or a horizontal
+    # scene edge does not.
+    step = 4
+    cols = range(0, rw, step)
+    span = len(list(cols))
+    tall = []
+    for r in range(y, min(h, y + rh)):
+        tall.append([luma_at(d, ((r * w + x + c) * 3)) for c in cols])
+    wide = [[tall[i][j] for i in range(len(tall))] for j in range(span)]
+    base2 = [sorted(col)[len(col) // 2] for col in wide]
+    stray = 0
+    for r, row in enumerate(tall):
+        if y0 <= y + r < y0 + line_h:
+            continue
+        lit_n = 0
+        trans = 0
+        prev = False
+        for j, v in enumerate(row):
+            on = (sign * (v - base2[j])) > 25
+            lit_n += 1 if on else 0
+            if on and not prev:
+                trans += 1
+            prev = on
+        if lit_n > span // 10 and trans >= 12:
+            stray += 1
+    # And the shape itself, against the font the server draws from. This is what
+    # separates text from a plausible-looking mess of strokes: the fallback blit
+    # paints a horizontally doubled copy of every glyph, which is bright, broken
+    # up into strokes, and in the right place - only it is not the date.
+    iou = None
+    if text and _font:
+        tpl = expect_line(_font, text, scale)
+        if len(tpl) == len(ink) and tpl[0]:
+            iou, at = template_iou(ink, tpl)
+    return {"line_h": line_h, "y0": y0, "rows_lit": len(lit),
+            "first_row": lit[0] if lit else -1,
+            "last_row": lit[-1] if lit else -1,
+            "ink": sum(rows), "edges": edges, "strength": strength,
+            "stray_rows": stray, "iou": iou, "bright": sign > 0}
+
+
+def do_legible(cam):
+    """Read the line back off the picture and say whether it can be read."""
+    rect = rect_from_log(cam, "main")
+    sub = rect_from_log(cam, "sub")
+    if not rect:
+        log("legible: no rect in %s; is the overlay on?" % BIN_LOG)
+        return 1
+    out = "/tmp/osd-legible.ppm"
+    if not grab(out):
+        return 1
+    w, h, d = rgbshot.read_ppm(out)
+    args, _ = current_args(cam)
+    toks = args.split() if isinstance(args, str) else list(args)
+    pos = toks[toks.index("--osd-pos") + 1] if "--osd-pos" in toks else "bl"
+    scale = 2
+    if "--osd-scale" in toks:
+        scale = int(toks[toks.index("--osd-scale") + 1])
+    line_h = 16 * scale
+    text = (fields(cam).get("osd_text") or "").strip()
+    if not font_cells(cam):
+        log("legible: %s did not read as the vendor font, so the glyphs cannot "
+            "be compared with anything - brightness and layout only" % FONT)
+    rc = 0
+    log("legible: main rect %dx%d at %d,%d, pos %s, scale %d, %r" %
+        (rect[2], rect[3], rect[0], rect[1], pos, scale, text))
+    got = legibility(w, h, d, rect, pos, line_h, text, scale)
+    if not got:
+        log("  could not measure that rect in the frame")
+        return 1
+    log("  ink %s over %d rows (rows %d..%d of the %d measured), %d stroke "
+        "edges, contrast %+.0f luma"
+        % ("bright" if got["bright"] else "dark", got["rows_lit"],
+           got["first_row"], got["last_row"], got["line_h"], got["edges"],
+           got["strength"]))
+    one = got["stray_rows"] <= 2
+    strong = abs(got["strength"]) > 20
+    shaped = (got["iou"] >= 0.50) if got["iou"] is not None else \
+        got["edges"] > 4 * got["line_h"]
+    if got["iou"] is not None:
+        log("  %.0f%% of the glyph pattern accounted for (measured ink against "
+            "the font file, best of a few pixels of slack)" % (100 * got["iou"]))
+    log("  %s  the expected glyphs (%s), one line (%s, %d stray rows in the "
+        "rect), visible (%s)"
+        % ("READABLE" if one and strong and shaped else "NOT READABLE",
+           "yes" if shaped else "no",
+           "yes" if one else "no", got["stray_rows"],
+           "yes" if strong else "no"))
+    if not (one and strong and shaped):
+        rc = 1
+        log("  hint: the display can keep the rect the previous run asked for and")
+        log("  slide the new bitmap into it - that looks exactly like this. Restart")
+        log("  the server (or power cycle) and measure again before believing it.")
+    if sub and rgbshot.grab(SUB_URL, "/tmp/osd-legible-sub.ppm"):
+        ws, hs, ds = rgbshot.read_ppm("/tmp/osd-legible-sub.ppm")
+        g = legibility(ws, hs, ds, sub, pos, line_h, text, scale)
+        if g:
+            log("  sub rect %dx%d at %d,%d: ink %s, %d rows, %d edges, "
+                "%+.0f luma%s" % (sub[2], sub[3], sub[0], sub[1],
+                                  "bright" if g["bright"] else "dark",
+                                  g["rows_lit"], g["edges"], g["strength"],
+                                  "" if g["iou"] is None else
+                                  ", template %.0f%%" % (100 * g["iou"])))
+            ok = abs(g["strength"]) > 20 and g["stray_rows"] <= 2 and \
+                ((g["iou"] >= 0.50) if g["iou"] is not None
+                 else g["edges"] > 4 * g["line_h"])
+            if not ok:
+                rc = 1
+    return rc
+
+
 def do_proof(cam):
     """Draw it, grab, undraw it, grab, put it back, and count the pixels.
 
@@ -742,10 +1002,44 @@ def do_test(cam):
         ref, ref_src = timeclock.reference_epoch()
         base = ref if ref else int(time.time())
         want = time.strftime("%Y-%m-%d %H:%M", time.localtime(base))
+        prev = time.strftime("%Y-%m-%d %H:%M", time.localtime(base - 60))
+        shown = (f.get("osd_text") or "").strip()
+        # A grabbed key frame is up to a GOP old and the server redraws only when
+        # the string changes, so a frame drawn at HH:MM:59 is still the picture
+        # being made when the reference has ticked on. The minute before is
+        # therefore accepted; anything older is a clock that stopped.
         check("drawn text is the reference's local minute",
-              (f.get("osd_text") or "").startswith(want),
-              "on screen %r, reference %r (%s)" % (f.get("osd_text"), want,
-                                                   ref_src or "workstation clock"))
+              shown.startswith(want) or shown.startswith(prev),
+              "on screen %r, reference %r%s (%s)"
+              % (shown, want,
+                 "" if shown.startswith(want) else " (matched the minute before)",
+                 ref_src or "workstation clock"))
+    if f.get("osd") == "on":
+        out = "/tmp/osd-test-legible.ppm"
+        rect = rect_from_log(cam)
+        toks = (" ".join(args)).split() if not isinstance(args, str) else args.split()
+        scale = int(toks[toks.index("--osd-scale") + 1]) if "--osd-scale" in toks else 2
+        font_cells(cam)
+        if not rgbshot.grab(URL, out):
+            check("text in the picture is legible", False, "frame grab failed")
+        elif not rect:
+            check("text in the picture is legible", False, "no rect in %s" % BIN_LOG)
+        else:
+            w, h, d = rgbshot.read_ppm(out)
+            got = legibility(w, h, d, rect, "br" if "--osd-pos" not in toks
+                             else toks[toks.index("--osd-pos") + 1],
+                             16 * scale, (f.get("osd_text") or "").strip(), scale)
+            ok = bool(got) and got["rows_lit"] > 0 and got["stray_rows"] <= 2 and \
+                abs(got["strength"]) > 20 and \
+                ((got["iou"] or 0) >= 0.50 if got["iou"] is not None
+                 else got["edges"] > 4 * got["line_h"])
+            check("text in the picture is legible", ok,
+                  "" if ok else ("no measurement" if not got else
+                                 "rows %d..%d, strength %+.0f, template %s" %
+                                 (got["first_row"], got["last_row"],
+                                  got["strength"],
+                                  "n/a" if got["iou"] is None else
+                                  "%.0f%%" % (100 * got["iou"]))))
     check("server logged where it placed the rect", rect_from_log(cam))
 
     fails = 0
@@ -788,6 +1082,13 @@ def main(argv):
                         "argument line unquoted")
                     return 2
                 extra += " --osd-fmt " + fmt
+            if "--scale" in args:
+                extra += " --osd-scale " + args[args.index("--scale") + 1]
+            for name, flag in (("--probe", "--osd-probe"),
+                               ("--nibble-hi", "--osd-nibble-hi"),
+                               ("--no-matrix", "--osd-no-matrix")):
+                if name in args:
+                    extra += " " + flag
             return do_flag(shell(), True, extra.strip() or None)
         if "--off" in args:
             return do_flag(shell(), False)
@@ -796,6 +1097,8 @@ def main(argv):
             if "--out" in args:
                 out = args[args.index("--out") + 1]
             return do_shot(shell(), out)
+        if "--legible" in args:
+            return do_legible(shell())
         if "--proof" in args:
             return do_proof(shell())
         if "--test" in args:
