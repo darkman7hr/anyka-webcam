@@ -373,9 +373,16 @@ all of them reversible.
   not running here, so log timestamps are relative, not wall-clock — unless section
   15 is followed. Until that service says `synced`, `akrtsp --osd-time` prints
   `NO TIME` into the picture rather than a date it cannot vouch for.
-* **The burned-in date is stamped twice, 16 px apart.** Not a bug in this code:
-  `libmpi_osd` on this generation stamps the string once per 16-row block of its
-  rect and refuses any rect shorter than twice the font size. Section 15.3.
+* **The overlay's rect has to be square, and one restart is not always enough
+  after changing it.** `libmpi_osd` range-checks the canvas with its two
+  dimensions crossed — a block's width against the rect's height — so `--osd-scale
+  2` asks for 500x500 to paint a 500x32 line: 125 KB of DMA canvas per channel,
+  most of it transparent. The alternative is the library's own text blit, which
+  writes 1 bpp into a 4 bpp display path and returns the date as a comb of
+  strokes. And the display has been seen to keep the rect the *previous* process
+  asked for and slide the new canvas into it, which looks exactly like garbled
+  text: `python3 tools/osd.py --legible` says so in one line, and one more restart
+  clears it. Section 15.3.
 
 ## 14. The stream server (`akrtsp`) and day/night
 
@@ -516,6 +523,7 @@ stops the service.
 python3 tools/osd.py --install       # akrtsp + run_akrtsp.sh + libmpi_osd.so
 python3 tools/osd.py --on --pos br   # tl | tr | bl | br
 python3 tools/osd.py --status
+python3 tools/osd.py --legible       # is the date actually readable? both channels
 python3 tools/osd.py --shot          # measure the text in a real frame
 python3 tools/osd.py --off
 ```
@@ -536,33 +544,50 @@ overnight.
 
 | `osd.py` | `akrtsp` | default | meaning |
 |---|---|---|---|
-| `--pos` | `--osd-pos` | `br` | corner the rect is anchored to |
-| `--size` | `--osd-size` | 16 | passed to `ak_osd_set_font_file`. On this board it only sets the minimum rect height (twice its value); it does **not** scale the glyphs |
-| `--rect-h` | `--osd-rect-h` | 2×size | rect height: shorter than 2×size the library refuses it, shorter than 32 the display path truncates it |
-| `--fmt` | `--osd-fmt` | `%Y-%m-%d %H:%M:%S` | the line, as strftime |
-| `--xoff` / `--yoff` | `--osd-xoff` / `--osd-yoff` | 0 | offset inside the rect, clamped per channel |
-| `--osd-sub 0` | `--osd-sub` | 1 | burn the main channel only |
+| `--pos` | `--osd-pos` | `bl` | corner the rect is anchored to; the line sits against that corner of the rect, 8 px in from the edge of the picture (`g_osd_margin` in the server, not a flag) |
+| `--scale` | `--osd-scale` | 2 | integer scaling of the composed line: 2 is a 16 px date in a 32 px row, 1 is 8 px in 16. It also sizes the rect, which has to be as wide as the line and as tall as it is wide — 500x500 at scale 2, 125 KB of DMA canvas per channel |
+| `--size` | `--osd-size` | 16 | handed to `ak_osd_set_font_file`, and the floor of the rect height (twice its value). It does **not** scale the glyphs on this board — `--scale` does, and on the `--no-matrix` fallback nothing does |
+| `--rect-h` | `--osd-rect-h` | 2×size | only consulted by the `--no-matrix` fallback; the composed path sizes its own rect |
+| `--fmt` | `--osd-fmt` | `%Y-%m-%d %H:%M:%S` | the line, as strftime. No spaces: the supervisor expands the argument line unquoted |
+| `--xoff` / `--yoff` | `--osd-xoff` / `--osd-yoff` | 0 | offset of the rect from the corner, clamped per channel. Ignored on the composed path's own placement (the line's position is inside the canvas), used by the fallback |
+| — | `--osd-no-sub` | off | burn the main channel only |
+| — | `--osd-color` / `--osd-bg` | palette | the two palette entries the canvas indices 0 and 1 select; index 0 is what the transparent pixels use |
+| — | `--osd-alpha` | library | overlay opacity, 1..100 |
+| `--no-matrix` | `--osd-no-matrix` | off | fall back to `ak_osd_draw_str`. It smears (1 bpp into a 4 bpp canvas) and stamps the line once per 16-row block; kept because it is the control the composed path gets measured against, and because `--legible` tells the two apart |
+| `--probe` | `--osd-probe` | off | draw the calibration pattern (two 4 px combs in opposite corners) instead of the date — this is how the canvas orientation was settled |
+| `--nibble-hi` | `--osd-nibble-hi` | off | treat the high nibble of each canvas byte as the left pixel. Off is what this display reads |
 
-### 15.3 What it produces, the flaw included
+### 15.3 What it produces, and how to tell it is really there
 
-`osd.py --shot` on the build described here: main rect `400x32 at 872,680`, sub
-rect `400x32 at 232,440`, 18–20 of 32 rows carrying stroke edges inside the rect
-(13 on the sub stream) and **0** in a same-sized control rect that has no text in
-it. Put the control at the top of the frame when measuring the sub stream: its
-mirror position overlaps the text band, and then it agrees with the rect perfectly
-while proving nothing.
+`--osd-time --osd-pos br --osd-scale 2` on the build described here: main rect
+`500x500 at 772,212`, sub rect `480x480 at 152,0`, each carrying **one** line of
+16 px digits — 32 rows at the bottom of the rect, the rest of the canvas
+transparent. `osd.py --legible` reads it back off a grabbed frame: contrast
++145 luma against the scene behind it, 0 rows of ink anywhere else in the rect,
+and 98% of the expected glyph pattern accounted for on the main stream against 70%
+on the sub one. `--test` runs the same measurement on the main channel as its
+thirteenth check.
 
-**The date is stamped twice, 16 px apart.** That is the library, not this code:
-`libmpi_osd` on this camera generation stamps the string once per 16-row block of
-its rect, refuses a rect shorter than `2 × --osd-size`, and truncates anything
-below two blocks with its own message (`Small buffer to disp osd, only disp 4
-characters of total 19`). Measured and ruled out: `--size 8 --rect-h 16` (four
-characters), `--size 32 --rect-h 64` (four copies), `--osd-sub 0` (second band
-unchanged), clearing the canvas below the first line after drawing (no effect).
-The library's real signatures, and why the canvas has to be cleared by stepping
-across the rect, are in README, "The date in the picture". One clean line is not
-available through this board's OSD; if the recording needs it, the text has to be
-added after the encoder, on the NVR side.
+What it replaced is `ak_osd_draw_str`, the vendor example's own call. That blit
+writes one bit per pixel into a canvas the display reads as four, so the date came
+out of the encoder as a comb of strokes — and on top of that it stamps the string
+once per 16-row block of its rect, refuses a rect shorter than `2 × --osd-size`,
+and truncates anything below two blocks with its own message (`Small buffer to
+disp osd, only disp 4 characters of total 19`). Both paths are still reachable, so
+none of this is taken on faith: `--no-matrix` runs the library's blit, and
+`--legible` scores it 12% against 98%. The library's real signatures, the canvas
+layout (row-major, stride `rect_w/2` bytes, palette index 1 for ink, 0 for
+transparent) and the crossed range checks that force the square rect are in README,
+"The date in the picture".
+
+Two consequences of that geometry worth knowing in advance. The square rect is not
+laziness — a block's width is range-checked against the rect's *height*, so a
+500x32 rect is refused with "para err, osd_w: 500, osd_h: 64" — and the price is
+125 KB of DMA canvas per channel; `--scale 1` brings that to about a third for an
+8 px date. And the display has been seen to keep the rect the *previous* process
+asked for and slide the new canvas into it, which looks exactly like garbled text:
+after changing the geometry, run `--legible` (that state scored 11%), and restart
+once more — it clears.
 
 ### 15.4 When it is wrong
 
@@ -570,9 +595,12 @@ added after the encoder, on the NVR side.
 |---|---|
 | `osd_text=NO TIME` in `/tmp/akrtsp.status` | `python3 tools/time.py --status`; then `--sync` and `--logs` |
 | time in the picture is hours off | `TZ_STR` in `/mnt/camweb/time/time.conf` — `run_takeover.sh` and `run_akrtsp.sh` export it, and the vendor environment sets `TZ=GMT-08:00`, which is exactly what broke once |
+| text sheared, doubled, or a comb of strokes | `python3 tools/osd.py --legible` — it says whether the pixels match the glyphs. Then check `--osd-no-matrix` is not sitting in `/mnt/camweb/akrtsp.args`, and restart again: the display may still be painting the previous run's rect |
+| date present but hard to read | `--legible` prints the contrast against the scene behind it. A white overlay over an IR-lit wall at night is the case that loses; move it with `--pos` or lower the exposure |
 | date right, text nowhere in the picture | `grep 'osd:' /tmp/akrtsp.log` for the rects actually used, then `osd.py --shot`; confirm `/usr/local/ak_font_16.bin` is readable |
-| line clipped to `2026-11-19 1` | the rect is narrower than the string's real advance, which is the font file's 16 px per character — shorten `--fmt` |
+| line clipped to `2026-11-19 1` | the rect is narrower than the string's real advance. The composed path sizes it from `--fmt` and drops `--scale` to 1 before it will clip anything; on `--no-matrix` the advance is the font file's 16 px per character whatever `--size` says — shorten `--fmt` |
 | handover never takes `:554` after adding the overlay | `LD_LIBRARY_PATH` in `run_takeover.sh` has to include `/mnt/camrtsp/lib`; without it `akrtsp` dies on a missing `libmpi_osd.so` and the loop only ever reports "nothing on :554" |
 | overlay settings gone after a reboot | the boot line and `/mnt/camweb/akrtsp.args` are on the card, not in `/tmp`: check both, then `python3 tools/time.py --test` |
+
 
 

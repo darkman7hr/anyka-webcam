@@ -1330,12 +1330,16 @@ osd_text=2026-11-19 18:42:06  # CET = UTC+1, correct for November
 the same path the vendor firmware used on this board (its boot log shows
 `ak_osd_set_font_file`, `ak_osd_init ch:0 fontS:32 res_w:1280 res_h:720` and a
 `ak_osd_set_rect` of 1280x64), with the font still on the card at
-`/usr/local/ak_font_16.bin`. It costs the 400 MHz core nothing measurable,
-because it is hardware, not software compositing. The server redraws when the
-minute changes — never per frame — and when the clock service has not confirmed a
-date it paints the words `NO TIME` rather than a date it cannot vouch for. The
-status file says all of it in words: `osd`, `osd_text`, `clock`, `clock_state`,
-`clock_peer`, `clock_last`.
+`/usr/local/ak_font_16.bin`. The pixels are not the library's, though: the line
+is composed in `akrtsp` — the ASCII cells of that font, one bit per pixel, blown
+up by `--osd-scale` — and pushed as a 4 bpp canvas with `ak_osd_draw_matrix()`.
+The library's own text blit is not called, and the reason is two paragraphs
+down. Nothing measurable is spent on it: drawing a 380x32 canvas when the minute
+turns is not work, and the compositing is hardware either way. The server redraws
+when the minute changes — never per frame — and when the clock service has not
+confirmed a date it paints the words `NO TIME` rather than a date it cannot vouch
+for. The status file says all of it in words: `osd`, `osd_text`, `clock`,
+`clock_state`, `clock_peer`, `clock_last`.
 
 The library is the reason this took longer than it should have. `ak_osd.h` in the
 SDK dump declares thirteen functions; the `libmpi_osd.so` this generation ships
@@ -1347,40 +1351,77 @@ board's kernel and libraries. What is actually called:
 | published header | this board's `.so` |
 |---|---|
 | `ak_osd_set_rect(vi, osd_chn, x, y, w, h)` (7 args in the newer header) | `ak_osd_set_rect(vi, channel, x, y, w, h)` — the rect index is gone |
+| `ak_osd_draw_matrix(chn, osd_rect, xoff, yoff, font_w, font_h, dot_buf, len)` (8 args) | `ak_osd_draw_matrix(channel, yoff, xoff, h, w, bits, len)` — 7: the rect index is gone, and the two dimensions arrive height-then-width, which is the same crossing its range checks make |
 | `ak_osd_draw_str(chn, xoff, yoff, unsigned short *str, len)` | same five, and `chn` is the **video** channel |
 | `ak_osd_clean_str(...)` | `ak_osd_clean_str(channel, xoff, row, -, -)`: the loop counter starts at `xoff` and runs up to the stored font height, and `row` is the first row cleared — so one call clears roughly one 16-row block. Put a width where the counter wants an x and it returns success having cleared nothing |
 
-**What the geometry can and cannot do.** Nothing documents this and the SDK's own
-example is inside `#if 0`, so it was measured:
+**What `ak_osd_draw_str` can and cannot do.** Nothing documents this and the
+SDK's own example is inside `#if 0`, so it was measured. It is kept here because
+it is what the replacement below had to work around — and because
+`--osd-no-matrix` still runs it, so the numbers can be re-checked:
 
 | attempt | result |
 |---|---|
-| rect `400x32`, font 16, bottom-right | works, and paints the date **twice**, 16 px apart — the library stamps the string once per 16-row block of the rect |
+| rect `400x32`, font 16, bottom-right | paints the date **twice**, 16 px apart — the library stamps the string once per 16-row block of the rect |
 | rect `200x16` (`--size 8 --rect-h 16`) | `set_rect` accepts it, the display path then truncates: `Small buffer to disp osd, only disp 4 characters of total 19` |
 | `--size 32 --rect-h 64` | four copies: the stamp pitch is the font file's 16 rows, whatever `--osd-size` says |
-| `--osd-sub 0` (main channel only) | second band unchanged — it is not the other channel bleeding in |
+| `--osd-size 8` and `--osd-size 32` | glyphs measured 16 px apart in the frame either way — the advance comes from the font file, not from the size argument, which is what clipped the line to `2026-11-19 1` until the rect was sized from the real advance |
+| `--osd-no-sub` (main channel only) | second band unchanged — it is not the other channel bleeding in |
 | clearing the canvas below the first line after drawing | no effect |
 
-So 32 rows is the smallest honest rect, and the date is stamped twice. Two real
-bugs were found on the way and are fixed in `akrtsp`: the canvas is now cleared by
-stepping `ak_osd_clean_str` across the rect — without that, stale text from the
-previous minute, from the previous geometry, and from the previous **process**
-(the OSD DMA canvas comes back from the pool uninitialised) stays burned into the
-recording beside the current date — and the rect width follows the font's real
-16 px advance instead of `--osd-size`, which is what had been clipping the line
-to `2026-11-19 1`.
+Doubling was the visible symptom; the reason the blit was dropped is underneath
+it. `ak_osd_draw_str` writes **one bit per pixel into a canvas the display reads
+as four** — the header is explicit that the buffer it is handed is `4bit … stands
+for 1 pixel`, and what it paints itself is a bitmap. Out of the encoder the date
+came back as a comb of strokes, and no rect geometry repairs that. So the library
+draws nothing.
 
-**How it is proved.** `tools/osd.py --shot` grabs one key frame and counts hard
-left-to-right luma transitions per row inside the rect *the server logged*,
-against a same-sized control rect elsewhere in the frame: 18–20 of 32 rows with
-edges in the rect and **0** in the control on the main stream (`400x32 at 872,680`),
-13 of 32 and **0** on the sub one (`400x32 at 232,440`). Where the control goes is
-part of the measurement: on the 640-wide sub stream a 400-wide rect has no mirror
-position that does not overlap the text itself, and an overlapping control matches
-the rect perfectly while proving nothing. Frame on/off diffs are useless here too:
+**The canvas the display does read.** Composed in `akrtsp` and pushed as one
+block with `ak_osd_draw_matrix(channel, 0, 0, h, w, bits, w*h/2)`. Three things
+about that canvas are not what the copy loop inside the function suggests, and all
+three were settled with probe patterns rather than by reasoning (20 Nov):
+
+| property | what it is, and how it was found |
+|---|---|
+| byte layout | row-major, stride `rect_w/2` bytes, two pixels to a byte, low nibble the left pixel. The column-major reading the memcpy loop implies — width iterations of `height/2` bytes — puts the picture through 90°: a probe line across the full width of the rect came back as a line down its full height. Two 120×120 combs of 4 px period in opposite corners tell a transpose from a mirror; correlate the frame with a square wave of the same period along each axis and the answer is unambiguous (`--osd-probe` draws them) |
+| range checks | crossed. The block's width is measured against the rect's **height** and its height against the rect's **width** — "para err, osd_w: 500, osd_h: 64" for a 500×64 block in a 500×64 rect — which is why the rect is square: `--osd-scale 2` on the main stream is a 500×500 rect of which 500×32 is pixels and the rest is transparent 0 |
+| the nibble | a palette index, not an opacity. Fifteen stripes of value 1..15 burned into the picture and diffed against the same scene without it: `1` brighter, `5..10` uniformly darker, `13..15` nothing at all. `1` is also the only value `draw_str` ever writes, and at the default palette it is the vendor's own white text; `0` is transparent, `8` black (`--osd-color`/`--osd-bg` move the pair) |
+
+The rect *is* the canvas: `draw_matrix` memcpy's the block in, so a block narrower
+than the stride slides across its own rows and a shorter one leaves the rest of the
+canvas as it came out of the pmem pool — whatever the last process left there,
+burned in beside the date. Every redraw therefore sends all of `w*h/2` bytes, and
+`--osd-scale` is the knob that trades DMA memory for glyph size: 2 is 125 KB per
+channel and a 16 px date, 1 is a third of that and an 8 px date. Nothing in the
+library clears the canvas any more, because nothing needs to: the block is memset
+to 0 before the glyphs are set and the whole thing is replaced each minute. (The
+fallback path still walks `ak_osd_clean_str` across the rect, one call per row of
+`--osd-size`, because its own clear call clears a slice and not the rect — the two
+bands in the picture that started this were two different strings at two different
+offsets, one of them left by an earlier process.)
+
+**How it is proved.** `tools/osd.py --legible` grabs one key frame and measures
+three things inside the rect *the server logged*: how far the ink stands off the
+scene behind it (each column's median above the line is the baseline), whether any
+other row of the rect carries ink at all (a second line, or the ghost of one), and
+— the one that decides it — how well the bright pixels overlap the glyphs that
+`/usr/local/ak_font_16.bin` says should be there, rendered independently in Python
+and correlated with a few pixels of slack. Measured on the camera right now: main
+**98%**, sub **70%**, contrast +145 luma, 0 stray rows in the rect. The same
+measurement scores **12%** on `--osd-no-matrix` and **11%** on a run where the
+display had kept the previous process's rect and slid the new canvas into it. The
+numbers this project believed for a day — brightness, stroke counts, left-to-right
+edge counts, one line versus two — pass all three of those cases, which is exactly
+how a date nobody could read got through a full test suite. `--test` runs the
+legibility check on the main channel as its thirteenth check.
+
+Two traps in the measuring itself. Frame on/off diffs are nearly useless:
 restarting the server reinitialises the ISP, the exposure moves, and two scene
 bands with no text in them at all correlate at 0.96 — which is also why "the ink
-numbers moved" is not evidence of anything.
+numbers moved" is not evidence, and why `--proof` pins the ISP mode for its
+duration. And the control rect is per channel: on the 640-wide sub stream a
+400-wide rect has no mirror position that does not overlap the text itself, and an
+overlapping control agrees with the rect perfectly while proving nothing.
 
 ## 5. Problems found that are worth fixing
 
@@ -1686,10 +1727,14 @@ anyka-cam/
                          --restore; --test compares the camera's epoch with this
                          workstation's, because 1970-plus-uptime looks plausible
   tools/osd.py           deploy and verify the burned-in date: --on/--off and the
-                         geometry (--pos, --size, --rect-h, --fmt, --xoff/--yoff),
-                         --shot measures the text in a real frame, --test checks
-                         files, md5s, flags and status fields; the flags land in
-                         /mnt/camweb/akrtsp.args and restart the server
+                         geometry (--pos, --scale, --size, --rect-h, --fmt,
+                         --xoff/--yoff), --legible reads the line back off a
+                         grabbed frame - contrast against the scene, one line and
+                         not two, the pixels against the glyphs in the vendor font
+                         file - --shot and --proof measure it against the scene,
+                         --test checks files, md5s, flags and status fields; the
+                         flags land in /mnt/camweb/akrtsp.args and restart the
+                         server
   tools/night-check.mjs  drive the day/night and IR panel in headless Chrome over
                          CDP: click the page's own buttons and only pass when the
                          camera reports that state back (mode in force, illuminator,
