@@ -562,11 +562,11 @@ overnight.
 `--osd-time --osd-pos br --osd-scale 2` on the build described here: main rect
 `500x500 at 772,212`, sub rect `480x480 at 152,0`, each carrying **one** line of
 16 px digits — 32 rows at the bottom of the rect, the rest of the canvas
-transparent. `osd.py --legible` reads it back off a grabbed frame: contrast
-+145 luma against the scene behind it, 0 rows of ink anywhere else in the rect,
-and 98% of the expected glyph pattern accounted for on the main stream against 70%
-on the sub one. `--test` runs the same measurement on the main channel as its
-thirteenth check.
+transparent. `osd.py --legible` reads it back off a grabbed frame: contrast +64
+luma against the row of scene it sits in, no second copy of the line anywhere else
+in the rect, and 89% of the expected glyph pattern accounted for on the main stream
+against 70% on the sub one. `--test` runs the same measurement on the main channel
+as its thirteenth check.
 
 What it replaced is `ak_osd_draw_str`, the vendor example's own call. That blit
 writes one bit per pixel into a canvas the display reads as four, so the date came
@@ -575,7 +575,7 @@ once per 16-row block of its rect, refuses a rect shorter than `2 × --osd-size`
 and truncates anything below two blocks with its own message (`Small buffer to
 disp osd, only disp 4 characters of total 19`). Both paths are still reachable, so
 none of this is taken on faith: `--no-matrix` runs the library's blit, and
-`--legible` scores it 12% against 98%. The library's real signatures, the canvas
+`--legible` scores it 13% against 89%. The library's real signatures, the canvas
 layout (row-major, stride `rect_w/2` bytes, palette index 1 for ink, 0 for
 transparent) and the crossed range checks that force the square rect are in README,
 "The date in the picture".

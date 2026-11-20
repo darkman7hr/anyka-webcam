@@ -1401,19 +1401,27 @@ bands in the picture that started this were two different strings at two differe
 offsets, one of them left by an earlier process.)
 
 **How it is proved.** `tools/osd.py --legible` grabs one key frame and measures
-three things inside the rect *the server logged*: how far the ink stands off the
-scene behind it (each column's median above the line is the baseline), whether any
-other row of the rect carries ink at all (a second line, or the ghost of one), and
-— the one that decides it — how well the bright pixels overlap the glyphs that
-`/usr/local/ak_font_16.bin` says should be there, rendered independently in Python
-and correlated with a few pixels of slack. Measured on the camera right now: main
-**98%**, sub **70%**, contrast +145 luma, 0 stray rows in the rect. The same
-measurement scores **12%** on `--osd-no-matrix` and **11%** on a run where the
-display had kept the previous process's rect and slid the new canvas into it. The
-numbers this project believed for a day — brightness, stroke counts, left-to-right
-edge counts, one line versus two — pass all three of those cases, which is exactly
-how a date nobody could read got through a full test suite. `--test` runs the
-legibility check on the main channel as its thirteenth check.
+three things inside the rect *the server logged*. How far the ink stands off the
+scene behind it — against the median of the thirty-three pixels of its own row,
+which follows a scene edge in every direction that text does not; a vertical
+baseline was tried first and reads every fence rail and leaf edge as a stroke, and
+a local minimum, which is the textbook answer for bright text, calls every speck
+of a noisy scene ink. Whether a second copy of the same line sits anywhere else in
+the rect — the expected string's column profile slid down the rect, so texture
+cannot trigger it and a doubled stamping cannot hide from it. And, the one that
+decides it, how well the ink overlaps the glyphs `/usr/local/ak_font_16.bin` says
+should be there, rendered independently in Python and correlated with a few pixels
+of slack, over every character but the last two: the status line that says what the
+frame ought to read is fetched a heartbeat after the frame, so the seconds disagree
+on a third of all runs and cost eight points of match for no information at all.
+Measured on the camera right now: main **89%**, sub **70%**, contrast +64 luma, and
+nowhere in the rect a second copy over 49% (the threshold is 55%, a real one scores
+about 90%). The same measurement on `--osd-no-matrix` — the library's own blit, one
+bit per pixel into a canvas the display reads as four — scores **13%**. The numbers
+this project believed for a day, brightness and stroke counts and left-to-right
+edge counts and one line versus two, pass every one of those failure cases, which
+is exactly how a date nobody could read got through a full test suite. `--test` runs
+the legibility check on the main channel as its thirteenth check.
 
 Two traps in the measuring itself. Frame on/off diffs are nearly useless:
 restarting the server reinitialises the ISP, the exposure moves, and two scene

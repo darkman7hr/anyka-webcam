@@ -713,15 +713,22 @@ def template_iou(ink, tpl, span=4):
 def legibility(w, h, d, rect, pos="br", line_h=32, text=None, scale=2):
     """Measure the burned-in line in a single frame.
 
-    The scene under the text changes slowly across a row, so the baseline for a
-    column is that column's median over a band well above the text; what is left
-    is the overlay. Ink is then the pixels that sit well off that baseline, and
-    three numbers say whether the line can be read: how strong it is, how many
-    rows carry strokes (one line's worth - two would mean the doubling this
-    library's own text blit produces), and how many stroke edges there are
-    (enough to be glyphs rather than a bar).
+    The ink is found against the median of the SAME ROW a few pixels either
+    side, not against what sits above and below. A glyph stroke is 2-4 px wide at
+    these scales, so the 33 pixels around it are scene; a scene edge - the thing a
+    vertical baseline reads as ink, which is how an earlier version of this check
+    called a readable date unreadable and an unreadable one readable - is constant
+    across all 33. Measured against the font on the same frames, the row median
+    scores 0.87 where the column median manages 0.81 and a local-minimum
+    background, which treats every bright speck of a textured scene as ink,
+    manages nothing. Bright ink is measured as a positive deviation from that
+    median, dark as a negative one.
 
-    Returns None when the rect is not inside the frame.
+    Out of that come three numbers. How far the ink sits off that background.
+    How well it matches the glyphs in the vendor font file. And whether another
+    copy of the same line is present somewhere else in the rect - what the
+    library's own text blit produces, and what a canvas slid into the previous
+    run's rect looks like. Returns None when the rect is not inside the frame.
     """
     x, y, rw, rh = rect
     if rw < 16 or rh < line_h:
@@ -729,73 +736,122 @@ def legibility(w, h, d, rect, pos="br", line_h=32, text=None, scale=2):
     y0 = y + rh - line_h if pos.startswith("b") else y
     if y0 < 0 or y0 + line_h > h or x + rw > w:
         return None
-    base_rows = range(max(0, y0 - 2 * line_h), min(h, y0 + line_h))
-    base = []
-    for c in range(rw):
-        v = sorted(luma_at(d, ((r * w + x + c) * 3)) for r in base_rows)
-        base.append(v[len(v) // 2])
-    dev = [[luma_at(d, ((r * w + x + c) * 3)) - base[c] for c in range(rw)]
-           for r in range(y0, y0 + line_h)]
-    # Which way the ink stands out depends on what is behind it: the palette's
-    # foreground over a dark corner reads brighter than its surroundings, over an
-    # IR-lit wall it does not. Both polarities are counted and the one carrying
-    # more ink wins - the same decision a person squinting at the frame makes.
-    lit_up = sum(1 for row in dev for v in row if v > 25)
-    lit_dn = sum(1 for row in dev for v in row if v < -25)
-    sign = 1 if lit_up >= lit_dn else -1
-    ink = [[(sign * v) > 25 for v in row] for row in dev]
+    HALF = 16
+    THR = 25
+
+    def deviations(r, step):
+        """(brighter than the row around it, darker than the row around it) for
+        every step-th pixel of one row of the rect. The background is the median
+        of the 33 pixels of the same row centred on the pixel: it follows a scene
+        edge in every direction the text does not."""
+        lum = [luma_at(d, ((r * w + x + c) * 3)) for c in range(rw)]
+        out = []
+        for c in range(0, rw, step):
+            lo = c - HALF if c >= HALF else 0
+            hi = c + HALF + 1
+            if hi > rw:
+                hi = rw
+            seg = sorted(lum[lo:hi])
+            bg = seg[len(seg) // 2]
+            v = lum[c]
+            out.append((v - bg, bg - v))
+        return out
+
+    band = [deviations(r, 1) for r in range(y0, y0 + line_h)]
+    tpl = None
+    if text and _font:
+        # The last two characters are the seconds, and the status line that says
+        # what the frame ought to read is fetched a heartbeat after the frame was
+        # taken - so they disagree by one second on a third of all runs, and
+        # comparing them costs eight points of match for no information at all.
+        # Everything before the final colon has had time to settle.
+        tpl = expect_line(_font, text[:-2] if len(text) > 4 else text, scale)
+
+    def render(sign):
+        return [[(up if sign > 0 else dn) > THR for up, dn in rowdev]
+                for rowdev in band]
+
+    # Which way the ink goes - brighter or darker than the scene behind it - is
+    # not settled by counting which polarity carries more pixels. In a textured
+    # scene almost every pixel has something brighter and something darker within
+    # sixteen of itself, so the count decides nothing; whether the expected glyphs
+    # turn out decides it. Both are rendered, the one that spells the date wins,
+    # and the colour it came out in is what gets reported.
+    if tpl is not None and len(tpl) == line_h:
+        each = [(template_iou(render(s), tpl)[0], s) for s in (1, -1)]
+        each.sort(reverse=True)
+        iou, sign = each[0]
+        ink = render(sign)
+    else:
+        # No font file to ask: fall back on the count, and say so by leaving the
+        # template number out of the answer rather than inventing one.
+        iou = None
+        n_up = sum(1 for rd in band for up, dn in rd if up > THR)
+        n_dn = sum(1 for rd in band for up, dn in rd if dn > THR)
+        sign = 1 if n_up >= n_dn else -1
+        ink = render(sign)
+
+    dev = [[up if sign > 0 else dn for up, dn in rowdev] for rowdev in band]
     rows = [sum(row) for row in ink]
     lit = [i for i, n in enumerate(rows) if n > rw // 8]
-    edges = 0
-    for row in ink:
-        edges += sum(1 for i in range(1, rw) if row[i] != row[i - 1])
-    strength = (sign * sum(dev[r][c] for r in range(line_h) for c in range(rw)
-                           if ink[r][c])) / float(max(1, sum(rows)))
-    # Every other row of the rect that carries ink is a second line, the ghost of
-    # the one just measured, or the library's own text blit leaking through - and
-    # the rect is much bigger than the line, so the band around the line says
-    # nothing about it. Sampled every fourth column, against a baseline taken over
-    # the whole rect (the scene brightens across 500 rows, and the band's baseline
-    # does not reach that far), and only counted as text when the row is broken up
-    # into many short runs: glyph strokes do that, a window frame or a horizontal
-    # scene edge does not.
-    step = 4
-    cols = range(0, rw, step)
-    span = len(list(cols))
-    tall = []
-    for r in range(y, min(h, y + rh)):
-        tall.append([luma_at(d, ((r * w + x + c) * 3)) for c in cols])
-    wide = [[tall[i][j] for i in range(len(tall))] for j in range(span)]
-    base2 = [sorted(col)[len(col) // 2] for col in wide]
+    edges = sum(sum(1 for i in range(1, len(row)) if row[i] != row[i - 1])
+                for row in ink)
+    strength = sum(dev[r][c] for r in range(len(dev)) for c in range(len(dev[r]))
+                   if ink[r][c]) / float(max(1, sum(rows)))
+
+    # Another copy of the same line, elsewhere in the rect. Asked as a question
+    # about the glyphs and not about texture: the expected column profile of the
+    # string is slid down the rect and compared with the ink per column. A fence,
+    # foliage or IR speckle has no idea what the date says and does not correlate;
+    # a second stamping of it does, wherever it lands. Column profiles because a
+    # copy can only be offset vertically - it is the same string, same x.
     stray = 0
-    for r, row in enumerate(tall):
-        if y0 <= y + r < y0 + line_h:
-            continue
-        lit_n = 0
-        trans = 0
-        prev = False
-        for j, v in enumerate(row):
-            on = (sign * (v - base2[j])) > 25
-            lit_n += 1 if on else 0
-            if on and not prev:
-                trans += 1
-            prev = on
-        if lit_n > span // 10 and trans >= 12:
-            stray += 1
-    # And the shape itself, against the font the server draws from. This is what
-    # separates text from a plausible-looking mess of strokes: the fallback blit
-    # paints a horizontally doubled copy of every glyph, which is bright, broken
-    # up into strokes, and in the right place - only it is not the date.
-    iou = None
-    if text and _font:
-        tpl = expect_line(_font, text, scale)
-        if len(tpl) == len(ink) and tpl[0]:
-            iou, at = template_iou(ink, tpl)
+    stray_at = -1
+    best = 0.0
+    if tpl:
+        step = 4
+        tprof = [sum(1 for r in range(len(tpl)) if tpl[r][c])
+                 for c in range(0, len(tpl[0]), step)]
+        width = min(len(tprof), 1 + (rw - 1) // step)
+        tprof = tprof[:width]
+        if width > 8 and lit:
+            rowprof = []
+            for r in range(y, min(h, y + rh)):
+                rowprof.append([1 if (up if sign > 0 else dn) > THR else 0
+                                for up, dn in deviations(r, step)][:width])
+            last = min(y + rh, h) - line_h
+            # A candidate has to be a copy of the line and not the line itself
+            # seen through a window slid a few rows off the band it was measured
+            # in: the strokes fill twenty of those thirty-two rows, and a window
+            # shifted six still holds most of them. So anything that overlaps the
+            # ink by more than half of it is the copy already accounted for - and
+            # a second copy that close would not be readable anyway.
+            it, ib = y0 + lit[0], y0 + lit[-1] + 1
+            for top in range(y, last + 1, 2):
+                if min(top + line_h, ib) - max(top, it) > (ib - it) // 2:
+                    continue
+                i0 = top - y
+                prof = [0] * width
+                for rp in rowprof[i0:i0 + line_h]:
+                    for j in range(width):
+                        prof[j] += rp[j]
+                inter = union = 0
+                for j in range(width):
+                    a, bl = prof[j], tprof[j]
+                    inter += a if a < bl else bl
+                    union += a if a > bl else bl
+                score = inter / float(union) if union else 0.0
+                if score > best:
+                    best = score
+                    stray_at = top
+            stray = 1 if best >= 0.55 else 0
     return {"line_h": line_h, "y0": y0, "rows_lit": len(lit),
             "first_row": lit[0] if lit else -1,
             "last_row": lit[-1] if lit else -1,
             "ink": sum(rows), "edges": edges, "strength": strength,
-            "stray_rows": stray, "iou": iou, "bright": sign > 0}
+            "iou": iou, "stray": stray, "stray_at": stray_at,
+            "stray_score": best, "bright": sign > 0}
+
 
 
 def do_legible(cam):
@@ -832,18 +888,20 @@ def do_legible(cam):
         % ("bright" if got["bright"] else "dark", got["rows_lit"],
            got["first_row"], got["last_row"], got["line_h"], got["edges"],
            got["strength"]))
-    one = got["stray_rows"] <= 2
+    one = not got["stray"]
     strong = abs(got["strength"]) > 20
     shaped = (got["iou"] >= 0.50) if got["iou"] is not None else \
         got["edges"] > 4 * got["line_h"]
     if got["iou"] is not None:
         log("  %.0f%% of the glyph pattern accounted for (measured ink against "
             "the font file, best of a few pixels of slack)" % (100 * got["iou"]))
-    log("  %s  the expected glyphs (%s), one line (%s, %d stray rows in the "
-        "rect), visible (%s)"
+    if got["stray_score"]:
+        log("  strongest second copy of that line anywhere in the rect: %.0f%% "
+            "at row %d" % (100 * got["stray_score"], got["stray_at"]))
+    log("  %s  the expected glyphs (%s), one line (%s), visible (%s)"
         % ("READABLE" if one and strong and shaped else "NOT READABLE",
            "yes" if shaped else "no",
-           "yes" if one else "no", got["stray_rows"],
+           "yes" if one else "another copy of it at row %d" % got["stray_at"],
            "yes" if strong else "no"))
     if not (one and strong and shaped):
         rc = 1
@@ -860,7 +918,7 @@ def do_legible(cam):
                                   g["rows_lit"], g["edges"], g["strength"],
                                   "" if g["iou"] is None else
                                   ", template %.0f%%" % (100 * g["iou"])))
-            ok = abs(g["strength"]) > 20 and g["stray_rows"] <= 2 and \
+            ok = abs(g["strength"]) > 20 and not g["stray"] and \
                 ((g["iou"] >= 0.50) if g["iou"] is not None
                  else g["edges"] > 4 * g["line_h"])
             if not ok:
@@ -1029,7 +1087,7 @@ def do_test(cam):
             got = legibility(w, h, d, rect, "br" if "--osd-pos" not in toks
                              else toks[toks.index("--osd-pos") + 1],
                              16 * scale, (f.get("osd_text") or "").strip(), scale)
-            ok = bool(got) and got["rows_lit"] > 0 and got["stray_rows"] <= 2 and \
+            ok = bool(got) and got["rows_lit"] > 0 and not got["stray"] and \
                 abs(got["strength"]) > 20 and \
                 ((got["iou"] or 0) >= 0.50 if got["iou"] is not None
                  else got["edges"] > 4 * got["line_h"])

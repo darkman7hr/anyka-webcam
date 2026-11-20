@@ -121,8 +121,8 @@ fi
     echo "            : out as a comb of strokes. The rect is square because"
     echo "            : draw_matrix range-checks the block with its two dimensions"
     echo "            : crossed. tools/osd.py --legible reads the line back off a"
-    echo "            : grabbed frame and matches it against the font file - 98% main"
-    echo "            : / 70% sub here, 12% through the library's blit"
+    echo "            : grabbed frame and matches it against the font file - 89% main"
+    echo "            : / 70% sub here, 13% through the library's blit"
 } > "$STAGE/$NAME/VERSION"
 
 chmod 755 "$STAGE/$NAME"/tools/*.py "$STAGE/$NAME"/tools/*.mjs \
